@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
 APEX-QUANT-OMNI SOVEREIGN v75.5 (HTML-Hardened Sniper Precision Edition)
-Institutional-Grade Automated XAUUSD (Spot Gold) Signal Generation:
-  - Multi-Source Failover + Live Swissquote BBO Spread Calibration
-  - High-Impact USD News Blackout Governor (CPI/NFP/FOMC)
-  - ADX Regime Filter + Liquidity Sweep & Fair Value Gap (FVG) Sniper Detection
-  - Anti-Chasing Extension Guard + Pullback-in-Trend Scoring + Order Flow Gate
-  - Hybrid Structural-ATR Stop Loss + Dynamic Killzone Thresholding
-  - Synchronized Grid Search Optimization + Auto-Trailing Stop + SQLite Forensic Audit
-  - HTML-Safe & Batch-Deduplicated 2-Way Telegram Command Engine
+Automated XAUUSD (Spot Gold) Signal Engine with Multi-Source Failover,
+Live Swissquote BBO Spread Calibration, High-Impact USD News Governor,
+ADX + FVG/Sweep Sniper Filter, Anti-Chasing Guard, Synchronized Grid Search,
+Auto-Trailing Stop, SQLite Forensic Audit, & 2-Way Telegram Commands.
 """
 
-# CRITICAL SERVERLESS SAFEGUARD: Headless Matplotlib Backend MUST be set first
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -40,29 +35,26 @@ import yfinance as yf
 # GLOBAL CONSTANTS & CONFIGURATION
 # ==============================================================================
 ENGINE_VERSION = "v75.5"
-SYMBOL_PRIMARY = "XAUUSD=X"  # Spot Gold (Explicitly avoiding futures GC=F)
+SYMBOL_PRIMARY = "XAUUSD=X"
 ASSET_LABEL = "XAUUSD (SPOT GOLD)"
 DB_PATH = os.getenv("SQLITE_DB_PATH", "trading_signals.db")
 CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
 EPSILON = 1e-8
 WIB_TZ = timezone(timedelta(hours=7))
 
-# Account & Risk Defaults
 DEFAULT_ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "10000.0"))
 DEFAULT_RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))
-CONTRACT_OUNCES_PER_LOT = 100.0  # Standard 1.00 XAUUSD Lot = 100 Troy Ounces
+CONTRACT_OUNCES_PER_LOT = 100.0
 MIN_LOT_SIZE = 0.01
 MAX_LOT_SIZE = 50.00
 CONFLUENCE_THRESHOLD = int(os.getenv("CONFLUENCE_THRESHOLD", "68"))
 ASIAN_SESSION_MIN_SCORE = max(CONFLUENCE_THRESHOLD + 8, 76)
 MAX_ALLOWED_SPREAD_USD = float(os.getenv("MAX_ALLOWED_SPREAD_USD", "3.00"))
 
-# Sniper Precision Guards
 MAX_EXTENSION_ATR = float(os.getenv("MAX_EXTENSION_ATR", "1.80"))
 MIN_ORDER_FLOW_CONFIRM = float(os.getenv("MIN_ORDER_FLOW_CONFIRM", "0.12"))
 ADX_TREND_MIN = float(os.getenv("ADX_TREND_MIN", "18.0"))
 
-# High-Impact USD News Governor Settings
 NEWS_BLACKOUT_BEFORE_MIN = int(os.getenv("NEWS_BLACKOUT_BEFORE_MIN", "45"))
 NEWS_BLACKOUT_AFTER_MIN = int(os.getenv("NEWS_BLACKOUT_AFTER_MIN", "30"))
 NEWS_CACHE_TTL_SECONDS = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "14400"))
@@ -71,12 +63,10 @@ TIER1_GOLD_CATALYSTS = (
     "PCE", "PPI", "GDP", "UNEMPLOYMENT", "RETAIL SALES", "ISM", "JOLTS",
 )
 
-# Secrets & Webhook Endpoints
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
-# Grid Search Parameter Space
 ATR_PERIOD_GRID = [10, 14, 20]
 Z_THRESHOLD_GRID = [1.5, 2.0, 2.5]
 
@@ -91,7 +81,6 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 
 def _esc(val: Any) -> str:
-    """Escapes <, >, & safely for Telegram HTML parse_mode."""
     return html.escape(str(val), quote=False)
 
 
@@ -199,18 +188,15 @@ def request_with_exponential_backoff(
     timeout: int = 15,
     **kwargs: Any,
 ) -> Optional[requests.Response]:
-    """Executes HTTP requests with strict exponential backoff (2s, 4s, 8s)."""
     attempt = 0
     while attempt <= max_retries:
         try:
             resp = requests.request(method=method, url=url, timeout=timeout, **kwargs)
             if resp.status_code in (200, 201, 204):
                 return resp
-
             if resp.status_code == 404:
                 logger.warning(f"HTTP 404 on {url}; failing over immediately.")
                 return resp
-
             if resp.status_code == 429 or 500 <= resp.status_code < 600:
                 if attempt < max_retries:
                     delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
@@ -224,10 +210,7 @@ def request_with_exponential_backoff(
                     time.sleep(delay)
                     attempt += 1
                     continue
-
-            logger.warning(
-                f"HTTP request returned status {resp.status_code} on {url}: {resp.text[:200]}"
-            )
+            logger.warning(f"HTTP {resp.status_code} on {url}: {resp.text[:200]}")
             return resp
         except requests.RequestException as exc:
             if attempt < max_retries:
@@ -249,10 +232,6 @@ def send_telegram_message(
     chat_id: Optional[str] = None,
     parse_mode: str = "HTML",
 ) -> bool:
-    """
-    Sends a formatted Telegram message using Exponential Backoff (2s, 4s, 8s).
-    Includes automatic plain-text fallback if Telegram rejects HTML entities (HTTP 400).
-    """
     target_chat = (chat_id or TELEGRAM_CHAT_ID).strip()
     if not TELEGRAM_BOT_TOKEN or not target_chat:
         logger.warning("Telegram credentials not configured; skipping Telegram delivery.")
@@ -271,17 +250,16 @@ def send_telegram_message(
     if resp is not None and resp.status_code == 200:
         return True
 
-    # Automatic plain-text fallback if HTML parsing ever fails with HTTP 400
     if resp is not None and resp.status_code == 400 and parse_mode:
         logger.warning("Telegram HTML parse 400 detected; retrying with plain-text fallback...")
         plain_text = html.unescape(re.sub(r"<[^>]+>", "", text))
-        fallback_payload = {
+        fb_payload = {
             "chat_id": target_chat,
             "text": plain_text,
             "disable_web_page_preview": True,
         }
         fb_resp = request_with_exponential_backoff(
-            "POST", url, max_retries=2, backoff_delays=(2, 4), json=fallback_payload
+            "POST", url, max_retries=2, backoff_delays=(2, 4), json=fb_payload
         )
         if fb_resp is not None and fb_resp.status_code == 200:
             return True
@@ -296,7 +274,6 @@ def send_telegram_photo(
     caption: str = "",
     chat_id: Optional[str] = None,
 ) -> bool:
-    """Uploads an image artifact to Telegram using Exponential Backoff (2s, 4s, 8s)."""
     target_chat = (chat_id or TELEGRAM_CHAT_ID).strip()
     if not TELEGRAM_BOT_TOKEN or not target_chat or not os.path.exists(image_path):
         return False
@@ -326,7 +303,6 @@ def send_telegram_photo(
 
 
 def send_discord_webhook(report: SignalReport) -> bool:
-    """Sends a structured institutional embed to Discord using Exponential Backoff."""
     if not DISCORD_WEBHOOK_URL:
         logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery.")
         return False
@@ -363,24 +339,9 @@ def send_discord_webhook(report: SignalReport) -> bool:
             {"name": "TP1 (1.5R)", "value": f"`{report.tp1:.2f}`", "inline": True},
             {"name": "TP2 (2.5R)", "value": f"`{report.tp2:.2f}`", "inline": True},
             {"name": "TP3 (4.0R)", "value": f"`{report.tp3:.2f}`", "inline": True},
-            {
-                "name": "Risk & Sizing",
-                "value": f"Lot: `{report.recommended_lot:.2f}` | Risk: `${report.risk_amount_usd:.2f}`",
-                "inline": True,
-            },
-            {
-                "name": "Grid Search Optimal",
-                "value": f"ATR: `{report.optimal_atr_period}` | Z: `{report.optimal_z_threshold:.1f}` | ADX: `{report.adx_value:.1f}`",
-                "inline": True,
-            },
-            {
-                "name": "Backtest Metrics",
-                "value": (
-                    f"WR: `{report.win_rate:.1f}%` | PF: `{report.profit_factor:.2f}` | "
-                    f"MDD: `{report.max_drawdown:.1f}%` | Exp: `{report.expectancy_r:+.2f}R`"
-                ),
-                "inline": True,
-            },
+            {"name": "Risk & Sizing", "value": f"Lot: `{report.recommended_lot:.2f}` | Risk: `${report.risk_amount_usd:.2f}`", "inline": True},
+            {"name": "Grid Search Optimal", "value": f"ATR: `{report.optimal_atr_period}` | Z: `{report.optimal_z_threshold:.1f}` | ADX: `{report.adx_value:.1f}`", "inline": True},
+            {"name": "Backtest Metrics", "value": f"WR: `{report.win_rate:.1f}%` | PF: `{report.profit_factor:.2f}` | MDD: `{report.max_drawdown:.1f}%` | Exp: `{report.expectancy_r:+.2f}R`", "inline": True},
         ],
         "footer": {"text": f"Feed: {report.data_source} | UTC: {report.timestamp_utc}"},
     }
@@ -393,7 +354,6 @@ def send_discord_webhook(report: SignalReport) -> bool:
 
 
 def send_emergency_telegram_alert(context: str, error: Exception) -> None:
-    """Dispatches critical exception telemetry to Telegram so silent failures never occur."""
     tb_snippet = _esc(traceback.format_exc()[-900:])
     msg = (
         f"🚨 <b>APEX-QUANT-OMNI {_esc(ENGINE_VERSION)} — EMERGENCY EXCEPTION ALERT</b> 🚨\n"
@@ -410,7 +370,6 @@ def send_emergency_telegram_alert(context: str, error: Exception) -> None:
 # SQLITE ARTIFACT PERSISTENCE & FORENSIC AUDIT LOGGER
 # ==============================================================================
 def init_sqlite_db(db_path: str = DB_PATH) -> None:
-    """Initializes the SQLite database schema for forensic audit, state, and trailing stops."""
     conn = sqlite3.connect(db_path)
     try:
         cursor = conn.cursor()
@@ -509,9 +468,7 @@ def set_bot_state(key: str, value: str, db_path: str = DB_PATH) -> None:
 
 
 def forensic_audit_log(report: SignalReport, db_path: str = DB_PATH) -> None:
-    """Outputs raw metrics to console and persists audit record into SQLite."""
     init_sqlite_db(db_path)
-
     raw_payload = {
         "pillar_breakdown": report.pillar_breakdown,
         "session": asdict(report.session_status),
@@ -623,14 +580,12 @@ def forensic_audit_log(report: SignalReport, db_path: str = DB_PATH) -> None:
 # MACRO HIGH-IMPACT USD NEWS CALENDAR GOVERNOR (CPI / NFP / FOMC)
 # ==============================================================================
 def _fetch_raw_economic_calendar() -> Tuple[List[Dict[str, Any]], str]:
-    """Fetches weekly macro calendar JSON with 4-hour SQLite cache."""
     now_epoch = int(time.time())
     cached_ts_str = get_bot_state("usd_news_cache_ts", "0")
     cached_json_str = get_bot_state("usd_news_cache_json", "")
 
     if cached_ts_str.isdigit() and cached_json_str:
-        age = now_epoch - int(cached_ts_str)
-        if age < NEWS_CACHE_TTL_SECONDS:
+        if (now_epoch - int(cached_ts_str)) < NEWS_CACHE_TTL_SECONDS:
             try:
                 parsed = json.loads(cached_json_str)
                 if isinstance(parsed, list):
@@ -674,7 +629,6 @@ def _fetch_raw_economic_calendar() -> Tuple[List[Dict[str, Any]], str]:
 
 
 def evaluate_news_governor(now_utc: Optional[datetime] = None) -> NewsGovernorStatus:
-    """Checks High-Impact USD events (CPI, NFP, FOMC, etc.) with [-45m, +30m] blackout."""
     now = now_utc or datetime.now(timezone.utc)
     raw_events, source = _fetch_raw_economic_calendar()
 
@@ -682,9 +636,9 @@ def evaluate_news_governor(now_utc: Optional[datetime] = None) -> NewsGovernorSt
     for item in raw_events:
         if not isinstance(item, dict):
             continue
-        country = str(item.get("country", "")).strip().upper()
-        impact = str(item.get("impact", "")).strip().upper()
-        if country != "USD" or impact != "HIGH":
+        if str(item.get("country", "")).strip().upper() != "USD":
+            continue
+        if str(item.get("impact", "")).strip().upper() != "HIGH":
             continue
 
         date_str = str(item.get("date", "")).strip()
@@ -692,27 +646,25 @@ def evaluate_news_governor(now_utc: Optional[datetime] = None) -> NewsGovernorSt
             continue
         try:
             ev_dt = datetime.fromisoformat(date_str)
-            if ev_dt.tzinfo is None:
-                ev_dt = ev_dt.replace(tzinfo=timezone.utc)
-            else:
-                ev_dt = ev_dt.astimezone(timezone.utc)
+            ev_dt = ev_dt.replace(tzinfo=timezone.utc) if ev_dt.tzinfo is None else ev_dt.astimezone(timezone.utc)
         except ValueError:
             continue
 
         title = str(item.get("title", "USD High-Impact Event")).strip()
         is_tier1 = any(kw in title.upper() for kw in TIER1_GOLD_CATALYSTS)
-        ev_obj = NewsEvent(
-            title=title,
-            event_utc=ev_dt.isoformat(),
-            impact="HIGH",
-            forecast=str(item.get("forecast", "") or "-").strip(),
-            previous=str(item.get("previous", "") or "-").strip(),
-            is_tier1_catalyst=is_tier1,
-        )
-        high_usd_events.append((ev_dt, ev_obj))
+        high_usd_events.append((
+            ev_dt,
+            NewsEvent(
+                title=title,
+                event_utc=ev_dt.isoformat(),
+                impact="HIGH",
+                forecast=str(item.get("forecast", "") or "-").strip(),
+                previous=str(item.get("previous", "") or "-").strip(),
+                is_tier1_catalyst=is_tier1,
+            ),
+        ))
 
     high_usd_events.sort(key=lambda pair: pair[0])
-
     horizon = now + timedelta(hours=48)
     upcoming_48h: List[NewsEvent] = [
         ev for dt_ev, ev in high_usd_events if (now - timedelta(minutes=NEWS_BLACKOUT_AFTER_MIN)) <= dt_ev <= horizon
@@ -721,10 +673,11 @@ def evaluate_news_governor(now_utc: Optional[datetime] = None) -> NewsGovernorSt
     for dt_ev, ev in high_usd_events:
         diff_min = (dt_ev - now).total_seconds() / 60.0
         if -NEWS_BLACKOUT_AFTER_MIN <= diff_min <= NEWS_BLACKOUT_BEFORE_MIN:
-            if diff_min >= 0:
-                timing_desc = f"releases in {int(round(diff_min))} min"
-            else:
-                timing_desc = f"released {int(round(abs(diff_min)))} min ago"
+            timing_desc = (
+                f"releases in {int(round(diff_min))} min"
+                if diff_min >= 0
+                else f"released {int(round(abs(diff_min)))} min ago"
+            )
             return NewsGovernorStatus(
                 is_allowed=False,
                 guard_state="NEWS_BLACKOUT_GUARD",
@@ -776,58 +729,27 @@ def evaluate_market_session(
     now_utc: Optional[datetime] = None,
     spot_quote: Optional[SpotQuote] = None,
 ) -> SessionStatus:
-    """Verifies UTC time, day of week, liquidity killzone, and live BBO spread."""
     now = now_utc or datetime.now(timezone.utc)
     weekday = now.weekday()
     hour = now.hour
     ts_str = now.isoformat()
 
     if weekday == 4 and hour >= 21:
-        return SessionStatus(
-            is_allowed=False,
-            session_name="WEEKEND_CLOSE_GUARD",
-            reason="Friday close window (>=21:00 UTC) suppressed to prevent weekend gap & spread slippage.",
-            utc_timestamp=ts_str,
-        )
+        return SessionStatus(False, "WEEKEND_CLOSE_GUARD", "Friday close window (>=21:00 UTC) suppressed.", ts_str)
     if weekday == 5:
-        return SessionStatus(
-            is_allowed=False,
-            session_name="WEEKEND_CLOSED",
-            reason="Saturday spot gold market closed.",
-            utc_timestamp=ts_str,
-        )
+        return SessionStatus(False, "WEEKEND_CLOSED", "Saturday spot gold market closed.", ts_str)
     if weekday == 6 and hour < 23:
-        return SessionStatus(
-            is_allowed=False,
-            session_name="SUNDAY_OPEN_GUARD",
-            reason="Sunday pre-open / illiquid initial open (<23:00 UTC) suppressed.",
-            utc_timestamp=ts_str,
-        )
-
+        return SessionStatus(False, "SUNDAY_OPEN_GUARD", "Sunday pre-open (<23:00 UTC) suppressed.", ts_str)
     if 21 <= hour < 22:
-        return SessionStatus(
-            is_allowed=False,
-            session_name="DAILY_ROLLOVER_GUARD",
-            reason="Daily FX/Gold rollover hour (21:00-22:00 UTC) suppressed due to spread expansion.",
-            utc_timestamp=ts_str,
-        )
+        return SessionStatus(False, "DAILY_ROLLOVER_GUARD", "Daily rollover hour (21:00-22:00 UTC) suppressed.", ts_str)
     if 22 <= hour < 23:
-        return SessionStatus(
-            is_allowed=False,
-            session_name="ASIAN_OPEN_NOISE_GUARD",
-            reason="Low-liquidity Asian open transition (22:00-23:00 UTC) suppressed.",
-            utc_timestamp=ts_str,
-        )
-
+        return SessionStatus(False, "ASIAN_OPEN_NOISE_GUARD", "Asian open transition (22:00-23:00 UTC) suppressed.", ts_str)
     if spot_quote is not None and spot_quote.spread > MAX_ALLOWED_SPREAD_USD:
         return SessionStatus(
-            is_allowed=False,
-            session_name="SPREAD_SPIKE_GUARD",
-            reason=(
-                f"Live spot spread ${spot_quote.spread:.2f} exceeds guard "
-                f"limit ${MAX_ALLOWED_SPREAD_USD:.2f}."
-            ),
-            utc_timestamp=ts_str,
+            False,
+            "SPREAD_SPIKE_GUARD",
+            f"Live spread ${spot_quote.spread:.2f} exceeds ${MAX_ALLOWED_SPREAD_USD:.2f}.",
+            ts_str,
         )
 
     if 0 <= hour < 7:
@@ -839,19 +761,13 @@ def evaluate_market_session(
     else:
         session_name = "NEW_YORK_SESSION_ACTIVE"
 
-    return SessionStatus(
-        is_allowed=True,
-        session_name=session_name,
-        reason="Active institutional liquidity window & tight spread verified.",
-        utc_timestamp=ts_str,
-    )
+    return SessionStatus(True, session_name, "Active liquidity window & tight spread verified.", ts_str)
 
 
 # ==============================================================================
 # MULTI-SOURCE FREE FALLBACK DATA PIPELINE (MT5 SPOT GOLD SYNC & FAILOVER)
 # ==============================================================================
 def _normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Flattens MultiIndex columns, normalizes UTC index, and adds EffectiveVolume."""
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -863,8 +779,7 @@ def _normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {c: str(c).strip().title() for c in df.columns}
     df = df.rename(columns=rename_map)
 
-    required = ["Open", "High", "Low", "Close"]
-    for col in required:
+    for col in ["Open", "High", "Low", "Close"]:
         if col not in df.columns:
             return pd.DataFrame()
 
@@ -881,10 +796,7 @@ def _normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, utc=True)
     else:
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        else:
-            df.index = df.index.tz_convert("UTC")
+        df.index = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
 
     df = df.sort_index()
     df = df[~df.index.duplicated(keep="last")]
@@ -895,11 +807,8 @@ def _normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_swissquote_live_spot_quote() -> Optional[SpotQuote]:
-    """Queries Swissquote free public BBO feed for live MT5-grade XAU/USD Bid/Ask/Spread."""
     url = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
-    resp = request_with_exponential_backoff(
-        "GET", url, max_retries=1, backoff_delays=(2,), timeout=8
-    )
+    resp = request_with_exponential_backoff("GET", url, max_retries=1, backoff_delays=(2,), timeout=8)
     if resp is None or resp.status_code != 200:
         return None
     try:
@@ -923,7 +832,6 @@ def fetch_swissquote_live_spot_quote() -> Optional[SpotQuote]:
 
 
 def _calibrate_dataframe_to_live_spot(df: pd.DataFrame, spot_quote: Optional[SpotQuote]) -> pd.DataFrame:
-    """Applies exact basis calibration to align feed closing price with live XAU/USD spot mid."""
     if df.empty or spot_quote is None:
         return df
     last_close = float(df["Close"].iloc[-1])
@@ -936,41 +844,26 @@ def _calibrate_dataframe_to_live_spot(df: pd.DataFrame, spot_quote: Optional[Spo
 
 
 def _fetch_from_yfinance_pair(ticker: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Primary Probe: yfinance official Spot Gold ticker XAUUSD=X."""
     try:
-        raw_15m = yf.download(
-            tickers=ticker, period="30d", interval="15m", progress=False, auto_adjust=False, threads=False
-        )
+        raw_15m = yf.download(tickers=ticker, period="30d", interval="15m", progress=False, auto_adjust=False, threads=False)
         df_15m = _normalize_ohlcv_dataframe(raw_15m)
         if len(df_15m) < 120:
             return pd.DataFrame(), pd.DataFrame()
-        raw_1h = yf.download(
-            tickers=ticker, period="60d", interval="1h", progress=False, auto_adjust=False, threads=False
-        )
-        df_1h = _normalize_ohlcv_dataframe(raw_1h)
-        return df_15m, df_1h
+        raw_1h = yf.download(tickers=ticker, period="60d", interval="1h", progress=False, auto_adjust=False, threads=False)
+        return df_15m, _normalize_ohlcv_dataframe(raw_1h)
     except Exception:
         return pd.DataFrame(), pd.DataFrame()
 
 
 def _fetch_from_yahoo_chart_http(ticker: str, interval: str, range_str: str) -> pd.DataFrame:
-    """Secondary Feed: Fast Yahoo Finance v8 HTTP Chart API probe."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-        )
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
     params = {"interval": interval, "range": range_str, "includePrePost": "false"}
-    resp = request_with_exponential_backoff(
-        "GET", url, max_retries=1, backoff_delays=(2,), timeout=10, headers=headers, params=params
-    )
+    resp = request_with_exponential_backoff("GET", url, max_retries=1, backoff_delays=(2,), timeout=10, headers=headers, params=params)
     if resp is None or resp.status_code != 200:
         return pd.DataFrame()
     try:
-        payload = resp.json()
-        result = payload["chart"]["result"][0]
+        result = resp.json()["chart"]["result"][0]
         timestamps = result["timestamp"]
         quote = result["indicators"]["quote"][0]
         df = pd.DataFrame(
@@ -992,17 +885,13 @@ def _fetch_from_yahoo_http_pair(ticker: str) -> Tuple[pd.DataFrame, pd.DataFrame
     df_15m = _fetch_from_yahoo_chart_http(ticker, "15m", "1mo")
     if len(df_15m) < 120:
         return pd.DataFrame(), pd.DataFrame()
-    df_1h = _fetch_from_yahoo_chart_http(ticker, "1h", "3mo")
-    return df_15m, df_1h
+    return df_15m, _fetch_from_yahoo_chart_http(ticker, "1h", "3mo")
 
 
 def _fetch_from_binance_spot_gold(interval: str, limit: int, spot_quote: Optional[SpotQuote]) -> pd.DataFrame:
-    """Tertiary Feed: Binance Vision public spot gold PAXGUSDT calibrated to Swissquote BBO."""
     url = "https://data-api.binance.vision/api/v3/klines"
     params = {"symbol": "PAXGUSDT", "interval": interval, "limit": limit}
-    resp = request_with_exponential_backoff(
-        "GET", url, max_retries=2, backoff_delays=(2, 4), timeout=12, params=params
-    )
+    resp = request_with_exponential_backoff("GET", url, max_retries=2, backoff_delays=(2, 4), timeout=12, params=params)
     if resp is None or resp.status_code != 200:
         return pd.DataFrame()
     try:
@@ -1025,12 +914,9 @@ def _fetch_from_binance_spot_gold(interval: str, limit: int, spot_quote: Optiona
 
 
 def _fetch_from_kraken_spot_gold(interval_min: int, spot_quote: Optional[SpotQuote]) -> pd.DataFrame:
-    """Quaternary Failover Feed: Kraken public OHLC API for PAXGUSD."""
     url = "https://api.kraken.com/0/public/OHLC"
     params = {"pair": "PAXGUSD", "interval": interval_min}
-    resp = request_with_exponential_backoff(
-        "GET", url, max_retries=2, backoff_delays=(2, 4), timeout=12, params=params
-    )
+    resp = request_with_exponential_backoff("GET", url, max_retries=2, backoff_delays=(2, 4), timeout=12, params=params)
     if resp is None or resp.status_code != 200:
         return pd.DataFrame()
     try:
@@ -1055,7 +941,6 @@ def _fetch_from_kraken_spot_gold(interval_min: int, spot_quote: Optional[SpotQuo
 
 
 def fetch_xauusd_mtf_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[SpotQuote]]:
-    """Fault-tolerant Multi-Source Data Ingestion for 15M execution and 1H macro data."""
     spot_quote = fetch_swissquote_live_spot_quote()
     if spot_quote:
         logger.info(
@@ -1064,14 +949,8 @@ def fetch_xauusd_mtf_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[S
         )
 
     sources = [
-        (
-            "Nominal (Primary: yfinance XAUUSD=X)",
-            lambda: _fetch_from_yfinance_pair(SYMBOL_PRIMARY),
-        ),
-        (
-            "Failover Active (Secondary: Yahoo v8 HTTP XAUUSD=X)",
-            lambda: _fetch_from_yahoo_http_pair(SYMBOL_PRIMARY),
-        ),
+        ("Nominal (Primary: yfinance XAUUSD=X)", lambda: _fetch_from_yfinance_pair(SYMBOL_PRIMARY)),
+        ("Failover Active (Secondary: Yahoo v8 HTTP XAUUSD=X)", lambda: _fetch_from_yahoo_http_pair(SYMBOL_PRIMARY)),
         (
             "Failover Active (Tertiary: Spot PAXG/XAUUSD + Swissquote BBO)",
             lambda: (
@@ -1101,42 +980,32 @@ def fetch_xauusd_mtf_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[S
         except Exception as exc:
             logger.warning(f"Feed [{source_label}] raised exception: {exc}. Advancing failover...")
 
-    raise RuntimeError(
-        "CRITICAL DATA OUTAGE: All multi-source Spot Gold (XAUUSD) feeds failed."
-    )
+    raise RuntimeError("CRITICAL DATA OUTAGE: All multi-source Spot Gold (XAUUSD) feeds failed.")
 
 
 # ==============================================================================
 # TECHNICAL INDICATORS, ADX REGIME & 5-PILLAR SNIPER QUANT ENGINE
 # ==============================================================================
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Computes Wilder-smoothed Average True Range with zero-division guard."""
     high = df["High"]
     low = df["Low"]
     prev_close = df["Close"].shift(1)
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    true_range = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     atr = true_range.ewm(alpha=1.0 / max(period, 1), adjust=False).mean()
     return atr.fillna(true_range).clip(lower=EPSILON)
 
 
 def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Computes Wilder's ADX to distinguish Trending vs Chop/Sideways regimes."""
     high = df["High"]
     low = df["Low"]
     prev_close = df["Close"].shift(1)
-
     up_move = high - high.shift(1)
     down_move = low.shift(1) - low
 
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    tr = pd.concat(
-        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     alpha = 1.0 / max(period, 1)
     tr_smooth = tr.ewm(alpha=alpha, adjust=False).mean().clip(lower=EPSILON)
 
@@ -1144,24 +1013,16 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     minus_di = 100.0 * pd.Series(minus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / (tr_smooth + EPSILON)
 
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di + EPSILON)
-    adx = dx.ewm(alpha=alpha, adjust=False).mean()
-    return adx.fillna(0.0)
+    return dx.ewm(alpha=alpha, adjust=False).mean().fillna(0.0)
 
 
 def compute_rolling_zscore(series: pd.Series, window: int = 20) -> pd.Series:
-    """Computes rolling Z-Score with mandatory epsilon protection against zero std."""
     rolling_mean = series.rolling(window=window, min_periods=max(5, window // 2)).mean()
     rolling_std = series.rolling(window=window, min_periods=max(5, window // 2)).std()
-    z_score = (series - rolling_mean) / (rolling_std + EPSILON)
-    return z_score.fillna(0.0)
+    return ((series - rolling_mean) / (rolling_std + EPSILON)).fillna(0.0)
 
 
 def analyze_pillar_1_smc(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]:
-    """
-    Pillar I (Sniper Smart Money Concepts):
-    Detects Swing Highs/Lows, BOS, ChoCh, Institutional Liquidity Sweeps,
-    and active Fair Value Gap (FVG) retests. Max 25 points.
-    """
     sub = df.tail(lookback).copy()
     opens = sub["Open"].values
     highs = sub["High"].values
@@ -1250,7 +1111,6 @@ def analyze_pillar_1_smc(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]
 
 
 def analyze_pillar_2_order_flow(df: pd.DataFrame, window: int = 8) -> Dict[str, Any]:
-    """Pillar II (Order Flow & Trigger Candle): Volume-weighted body-to-wick delta."""
     sub = df.tail(window).copy()
     body = sub["Close"] - sub["Open"]
     abs_body = body.abs()
@@ -1271,9 +1131,7 @@ def analyze_pillar_2_order_flow(df: pd.DataFrame, window: int = 8) -> Dict[str, 
     last_dir = "BULLISH" if last_body > 0 else ("BEARISH" if last_body < 0 else "NEUTRAL")
 
     if vw_pressure >= MIN_ORDER_FLOW_CONFIRM:
-        pts = min(20, int(13 + vw_pressure * 12 + body_efficiency * 4))
-        if last_dir == "BULLISH" and last_body_ratio >= 0.40:
-            pts = min(20, pts + 2)
+        pts = min(20, int(13 + vw_pressure * 12 + body_efficiency * 4) + (2 if last_dir == "BULLISH" and last_body_ratio >= 0.40 else 0))
         return {
             "bias": "BULLISH",
             "points": pts,
@@ -1283,9 +1141,7 @@ def analyze_pillar_2_order_flow(df: pd.DataFrame, window: int = 8) -> Dict[str, 
             "trigger_dir": last_dir,
         }
     if vw_pressure <= -MIN_ORDER_FLOW_CONFIRM:
-        pts = min(20, int(13 + abs(vw_pressure) * 12 + body_efficiency * 4))
-        if last_dir == "BEARISH" and last_body_ratio >= 0.40:
-            pts = min(20, pts + 2)
+        pts = min(20, int(13 + abs(vw_pressure) * 12 + body_efficiency * 4) + (2 if last_dir == "BEARISH" and last_body_ratio >= 0.40 else 0))
         return {
             "bias": "BEARISH",
             "points": pts,
@@ -1310,7 +1166,6 @@ def analyze_pillar_3_zscore_sniper(
     macro_bias: str,
     window: int = 20,
 ) -> Dict[str, Any]:
-    """Pillar III (Sniper Z-Score Pullback & Anti-Chasing Engine). Max 20 points."""
     z_series = compute_rolling_zscore(df["Close"], window=window)
     z_now = float(z_series.iloc[-1])
     z_prev = float(z_series.iloc[-2]) if len(z_series) >= 2 else z_now
@@ -1320,69 +1175,22 @@ def analyze_pillar_3_zscore_sniper(
     ema20_dist_atr = float((df["Close"].iloc[-1] - ema20.iloc[-1]) / (atr14.iloc[-1] + EPSILON))
 
     if z_now <= -z_threshold:
-        pts = 20 if z_now > z_prev else 17
-        return {
-            "bias": "BULLISH",
-            "points": pts,
-            "z_score": z_now,
-            "ema20_dist_atr": round(ema20_dist_atr, 2),
-            "state": "EXTREME_OVERSOLD_REVERSION",
-        }
+        return {"bias": "BULLISH", "points": 20 if z_now > z_prev else 17, "z_score": z_now, "ema20_dist_atr": round(ema20_dist_atr, 2), "state": "EXTREME_OVERSOLD_REVERSION"}
     if z_now >= z_threshold:
-        pts = 20 if z_now < z_prev else 17
-        return {
-            "bias": "BEARISH",
-            "points": pts,
-            "z_score": z_now,
-            "ema20_dist_atr": round(ema20_dist_atr, 2),
-            "state": "EXTREME_OVERBOUGHT_REVERSION",
-        }
-
+        return {"bias": "BEARISH", "points": 20 if z_now < z_prev else 17, "z_score": z_now, "ema20_dist_atr": round(ema20_dist_atr, 2), "state": "EXTREME_OVERBOUGHT_REVERSION"}
     if macro_bias == "BULLISH" and -z_threshold < z_now <= 0.65 and z_now >= z_prev:
-        return {
-            "bias": "BULLISH",
-            "points": 18,
-            "z_score": z_now,
-            "ema20_dist_atr": round(ema20_dist_atr, 2),
-            "state": "OPTIMAL_BULL_PULLBACK",
-        }
+        return {"bias": "BULLISH", "points": 18, "z_score": z_now, "ema20_dist_atr": round(ema20_dist_atr, 2), "state": "OPTIMAL_BULL_PULLBACK"}
     if macro_bias == "BEARISH" and -0.65 <= z_now < z_threshold and z_now <= z_prev:
-        return {
-            "bias": "BEARISH",
-            "points": 18,
-            "z_score": z_now,
-            "ema20_dist_atr": round(ema20_dist_atr, 2),
-            "state": "OPTIMAL_BEAR_PULLBACK",
-        }
-
+        return {"bias": "BEARISH", "points": 18, "z_score": z_now, "ema20_dist_atr": round(ema20_dist_atr, 2), "state": "OPTIMAL_BEAR_PULLBACK"}
     if z_now < -0.65:
-        return {
-            "bias": "NEUTRAL",
-            "points": 7,
-            "z_score": z_now,
-            "ema20_dist_atr": round(ema20_dist_atr, 2),
-            "state": "STRETCHED_LOW_NO_CHASE",
-        }
+        return {"bias": "NEUTRAL", "points": 7, "z_score": z_now, "ema20_dist_atr": round(ema20_dist_atr, 2), "state": "STRETCHED_LOW_NO_CHASE"}
     if z_now > 0.65:
-        return {
-            "bias": "NEUTRAL",
-            "points": 7,
-            "z_score": z_now,
-            "ema20_dist_atr": round(ema20_dist_atr, 2),
-            "state": "STRETCHED_HIGH_NO_CHASE",
-        }
+        return {"bias": "NEUTRAL", "points": 7, "z_score": z_now, "ema20_dist_atr": round(ema20_dist_atr, 2), "state": "STRETCHED_HIGH_NO_CHASE"}
 
-    return {
-        "bias": macro_bias if macro_bias != "NEUTRAL" else "NEUTRAL",
-        "points": 11,
-        "z_score": z_now,
-        "ema20_dist_atr": round(ema20_dist_atr, 2),
-        "state": "EQUILIBRIUM_VALUE_ZONE",
-    }
+    return {"bias": macro_bias if macro_bias != "NEUTRAL" else "NEUTRAL", "points": 11, "z_score": z_now, "ema20_dist_atr": round(ema20_dist_atr, 2), "state": "EQUILIBRIUM_VALUE_ZONE"}
 
 
 def analyze_pillar_4_mtf_harmony(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> Dict[str, Any]:
-    """Pillar IV (Multi-Timeframe Fractal Harmony + ADX Trend Regime). Max 20 points."""
     ema20_1h = df_1h["Close"].ewm(span=20, adjust=False).mean()
     ema50_1h = df_1h["Close"].ewm(span=50, adjust=False).mean()
     ema20_15m = df_15m["Close"].ewm(span=20, adjust=False).mean()
@@ -1400,11 +1208,9 @@ def analyze_pillar_4_mtf_harmony(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> D
     smc_1h = analyze_pillar_1_smc(df_1h, lookback=60)
 
     if macro_bull and exec_bull and smc_1h["bias"] == "BULLISH":
-        pts = 20 if adx_15m >= ADX_TREND_MIN else 15
-        return {"bias": "BULLISH", "points": pts, "adx_15m": round(adx_15m, 2), "adx_1h": round(adx_1h, 2), "state": "1H_15M_FULL_BULL_HARMONY"}
+        return {"bias": "BULLISH", "points": 20 if adx_15m >= ADX_TREND_MIN else 15, "adx_15m": round(adx_15m, 2), "adx_1h": round(adx_1h, 2), "state": "1H_15M_FULL_BULL_HARMONY"}
     if macro_bear and exec_bear and smc_1h["bias"] == "BEARISH":
-        pts = 20 if adx_15m >= ADX_TREND_MIN else 15
-        return {"bias": "BEARISH", "points": pts, "adx_15m": round(adx_15m, 2), "adx_1h": round(adx_1h, 2), "state": "1H_15M_FULL_BEAR_HARMONY"}
+        return {"bias": "BEARISH", "points": 20 if adx_15m >= ADX_TREND_MIN else 15, "adx_15m": round(adx_15m, 2), "adx_1h": round(adx_1h, 2), "state": "1H_15M_FULL_BEAR_HARMONY"}
     if (macro_bull and exec_bull) or (smc_1h["bias"] == "BULLISH" and exec_bull):
         return {"bias": "BULLISH", "points": 14, "adx_15m": round(adx_15m, 2), "adx_1h": round(adx_1h, 2), "state": "1H_15M_PARTIAL_BULL_ALIGN"}
     if (macro_bear and exec_bear) or (smc_1h["bias"] == "BEARISH" and exec_bear):
@@ -1423,19 +1229,13 @@ def analyze_pillar_5_atr_risk(
     account_balance: float = DEFAULT_ACCOUNT_BALANCE,
     risk_percent: float = DEFAULT_RISK_PERCENT,
 ) -> Dict[str, Any]:
-    """Pillar V (Hybrid Structural-ATR Risk & Dynamic Sizing)."""
     atr_14 = float(compute_atr(df_15m, period=14).iloc[-1])
     atr_opt = float(compute_atr(df_15m, period=optimal_atr_period).iloc[-1])
     atr_exec = (atr_14 + atr_opt) / 2.0
 
-    close_last = float(df_15m["Close"].iloc[-1])
-    if spot_quote is not None:
-        entry = spot_quote.ask if direction == "BULLISH" else spot_quote.bid
-    else:
-        entry = close_last
+    entry = (spot_quote.ask if direction == "BULLISH" else spot_quote.bid) if spot_quote is not None else float(df_15m["Close"].iloc[-1])
 
-    atr_series = compute_atr(df_15m, period=14)
-    median_atr = float(atr_series.tail(100).median()) + EPSILON
+    median_atr = float(compute_atr(df_15m, period=14).tail(100).median()) + EPSILON
     vol_ratio = atr_14 / median_atr
 
     min_sl_dist = max(1.2 * atr_exec, 1.50)
@@ -1445,30 +1245,23 @@ def analyze_pillar_5_atr_risk(
         structural_dist = (swing_high + 0.35 * atr_exec) - entry
         risk_dist = min(max_sl_dist, max(min_sl_dist, structural_dist))
         sl = entry + risk_dist
-        tp1 = entry - (1.5 * risk_dist)
-        tp2 = entry - (2.5 * risk_dist)
-        tp3 = entry - (4.0 * risk_dist)
+        tp1, tp2, tp3 = entry - 1.5 * risk_dist, entry - 2.5 * risk_dist, entry - 4.0 * risk_dist
     else:
         structural_dist = entry - (swing_low - 0.35 * atr_exec)
         risk_dist = min(max_sl_dist, max(min_sl_dist, structural_dist))
         sl = entry - risk_dist
-        tp1 = entry + (1.5 * risk_dist)
-        tp2 = entry + (2.5 * risk_dist)
-        tp3 = entry + (4.0 * risk_dist)
+        tp1, tp2, tp3 = entry + 1.5 * risk_dist, entry + 2.5 * risk_dist, entry + 4.0 * risk_dist
 
     risk_usd = account_balance * (risk_percent / 100.0)
     raw_lots = risk_usd / ((risk_dist + EPSILON) * CONTRACT_OUNCES_PER_LOT)
     recommended_lot = round(min(MAX_LOT_SIZE, max(MIN_LOT_SIZE, raw_lots)), 2)
 
     if 0.6 <= vol_ratio <= 2.2:
-        pts = 15
-        vol_state = "OPTIMAL_ATR_REGIME"
+        pts, vol_state = 15, "OPTIMAL_ATR_REGIME"
     elif 0.35 <= vol_ratio <= 3.0:
-        pts = 11
-        vol_state = "MODERATE_ATR_REGIME"
+        pts, vol_state = 11, "MODERATE_ATR_REGIME"
     else:
-        pts = 5
-        vol_state = "EXTREME_VOLATILITY_GUARD"
+        pts, vol_state = 5, "EXTREME_VOLATILITY_GUARD"
 
     return {
         "entry": round(entry, 2),
@@ -1497,7 +1290,6 @@ def _simulate_strategy_backtest(
     initial_capital: float = DEFAULT_ACCOUNT_BALANCE,
     risk_pct: float = DEFAULT_RISK_PERCENT,
 ) -> GridSearchResult:
-    """Synchronized Sniper strategy backtest with multi-tier TP & BE trailing."""
     df = df_15m.copy()
     df["ATR"] = compute_atr(df, period=atr_period)
     df["ADX"] = compute_adx(df, period=14)
@@ -1532,43 +1324,19 @@ def _simulate_strategy_backtest(
     timestamps: List[pd.Timestamp] = [df.index[0]]
     trade_log: List[Dict[str, Any]] = []
 
-    gross_profit = 0.0
-    gross_loss = 0.0
-    wins = 0
-    losses = 0
-    total_r = 0.0
-
-    in_pos = False
-    pos_dir = 0
-    entry_p = 0.0
-    sl_p = 0.0
-    tp1_p = 0.0
-    tp2_p = 0.0
-    tp3_p = 0.0
-    risk_dist = 1.0
-    pos_atr = 1.0
-    remaining_weight = 1.0
-    realized_r = 0.0
-    tp1_hit = False
-    tp2_hit = False
-    risk_usd = 0.0
+    gross_profit, gross_loss, wins, losses, total_r = 0.0, 0.0, 0, 0, 0.0
+    in_pos, pos_dir = False, 0
+    entry_p = sl_p = tp1_p = tp2_p = tp3_p = 0.0
+    risk_dist = pos_atr = remaining_weight = 1.0
+    realized_r = risk_usd = 0.0
+    tp1_hit = tp2_hit = False
     entry_time: Optional[pd.Timestamp] = None
 
-    opens = df["Open"].values
-    highs = df["High"].values
-    lows = df["Low"].values
-    closes = df["Close"].values
-    atrs = df["ATR"].values
-    adxs = df["ADX"].values
-    zs = df["Z"].values
-    ema20s = df["EMA20"].values
-    ema50s = df["EMA50"].values
-    h1_biases = df["H1_BIAS"].values
-    vw_flows = df["VW_FLOW"].values
-    body_ratios = df["BODY_RATIO"].values
-    sh12 = df["SWING_HIGH_12"].values
-    sl12 = df["SWING_LOW_12"].values
-    idx_list = df.index
+    opens, highs, lows, closes = df["Open"].values, df["High"].values, df["Low"].values, df["Close"].values
+    atrs, adxs, zs = df["ATR"].values, df["ADX"].values, df["Z"].values
+    ema20s, ema50s, h1_biases = df["EMA20"].values, df["EMA50"].values, df["H1_BIAS"].values
+    vw_flows, body_ratios = df["VW_FLOW"].values, df["BODY_RATIO"].values
+    sh12, sl12, idx_list = df["SWING_HIGH_12"].values, df["SWING_LOW_12"].values, df.index
 
     start_bar = max(60, atr_period + 5)
     for i in range(start_bar, len(df)):
@@ -1578,10 +1346,8 @@ def _simulate_strategy_backtest(
 
             if pos_dir == 1:
                 if lows[i] <= sl_p:
-                    rem_r = (sl_p - entry_p) / (risk_dist + EPSILON)
-                    realized_r += remaining_weight * rem_r
-                    exit_p = sl_p
-                    trade_closed = True
+                    realized_r += remaining_weight * ((sl_p - entry_p) / (risk_dist + EPSILON))
+                    exit_p, trade_closed = sl_p, True
                 else:
                     if not tp1_hit and highs[i] >= tp1_p:
                         tp1_hit = True
@@ -1595,17 +1361,13 @@ def _simulate_strategy_backtest(
                         sl_p = max(sl_p, tp1_p)
                     if highs[i] >= tp3_p:
                         realized_r += remaining_weight * 4.0
-                        exit_p = tp3_p
-                        trade_closed = True
+                        exit_p, trade_closed = tp3_p, True
                     elif tp1_hit:
-                        trail_step = highs[i] - (1.0 * pos_atr)
-                        sl_p = max(sl_p, trail_step)
+                        sl_p = max(sl_p, highs[i] - pos_atr)
             else:
                 if highs[i] >= sl_p:
-                    rem_r = (entry_p - sl_p) / (risk_dist + EPSILON)
-                    realized_r += remaining_weight * rem_r
-                    exit_p = sl_p
-                    trade_closed = True
+                    realized_r += remaining_weight * ((entry_p - sl_p) / (risk_dist + EPSILON))
+                    exit_p, trade_closed = sl_p, True
                 else:
                     if not tp1_hit and lows[i] <= tp1_p:
                         tp1_hit = True
@@ -1619,11 +1381,9 @@ def _simulate_strategy_backtest(
                         sl_p = min(sl_p, tp1_p)
                     if lows[i] <= tp3_p:
                         realized_r += remaining_weight * 4.0
-                        exit_p = tp3_p
-                        trade_closed = True
+                        exit_p, trade_closed = tp3_p, True
                     elif tp1_hit:
-                        trail_step = lows[i] + (1.0 * pos_atr)
-                        sl_p = min(sl_p, trail_step)
+                        sl_p = min(sl_p, lows[i] + pos_atr)
 
             if trade_closed:
                 pnl = risk_usd * realized_r
@@ -1636,104 +1396,70 @@ def _simulate_strategy_backtest(
                     gross_loss += abs(pnl)
                     losses += 1
                 peak_equity = max(peak_equity, equity)
-                dd_pct = ((peak_equity - equity) / (peak_equity + EPSILON)) * 100.0
-                max_drawdown_pct = max(max_drawdown_pct, dd_pct)
+                max_drawdown_pct = max(max_drawdown_pct, ((peak_equity - equity) / (peak_equity + EPSILON)) * 100.0)
                 equity_curve.append(equity)
                 timestamps.append(idx_list[i])
-                trade_log.append(
-                    {
-                        "entry_time": str(entry_time),
-                        "exit_time": str(idx_list[i]),
-                        "direction": "BUY" if pos_dir == 1 else "SELL",
-                        "entry": round(entry_p, 2),
-                        "exit": round(exit_p, 2),
-                        "r_multiple": round(realized_r, 2),
-                        "pnl_usd": round(pnl, 2),
-                    }
-                )
+                trade_log.append({
+                    "entry_time": str(entry_time),
+                    "exit_time": str(idx_list[i]),
+                    "direction": "BUY" if pos_dir == 1 else "SELL",
+                    "entry": round(entry_p, 2),
+                    "exit": round(exit_p, 2),
+                    "r_multiple": round(realized_r, 2),
+                    "pnl_usd": round(pnl, 2),
+                })
                 in_pos = False
-                continue
-
         else:
             bar_dt = idx_list[i].to_pydatetime()
             if 21 <= bar_dt.hour < 23:
                 continue
 
-            z_val = zs[i]
-            z_prev = zs[i - 1]
-            c_val = closes[i]
-            atr_val = max(atrs[i], 0.5)
-            adx_val = adxs[i]
+            z_val, z_prev = zs[i], zs[i - 1]
+            c_val, atr_val, adx_val = closes[i], max(atrs[i], 0.5), adxs[i]
             ext_atr = (c_val - ema20s[i]) / (atr_val + EPSILON)
 
             bull_trend = ema20s[i] > ema50s[i] and h1_biases[i] >= 0 and adx_val >= ADX_TREND_MIN
             bear_trend = ema20s[i] < ema50s[i] and h1_biases[i] <= 0 and adx_val >= ADX_TREND_MIN
 
-            bull_pullback = bull_trend and (-z_threshold < z_val <= 0.65) and z_val >= z_prev and ext_atr <= MAX_EXTENSION_ATR
-            bull_sweep_rev = z_val <= -z_threshold and z_val > z_prev
             bull_signal = (
-                (bull_pullback or bull_sweep_rev)
+                ((bull_trend and (-z_threshold < z_val <= 0.65) and z_val >= z_prev and ext_atr <= MAX_EXTENSION_ATR)
+                 or (z_val <= -z_threshold and z_val > z_prev))
                 and vw_flows[i] >= MIN_ORDER_FLOW_CONFIRM
                 and c_val > opens[i]
                 and body_ratios[i] >= 0.35
             )
-
-            bear_pullback = bear_trend and (-0.65 <= z_val < z_threshold) and z_val <= z_prev and ext_atr >= -MAX_EXTENSION_ATR
-            bear_sweep_rev = z_val >= z_threshold and z_val < z_prev
             bear_signal = (
-                (bear_pullback or bear_sweep_rev)
+                ((bear_trend and (-0.65 <= z_val < z_threshold) and z_val <= z_prev and ext_atr >= -MAX_EXTENSION_ATR)
+                 or (z_val >= z_threshold and z_val < z_prev))
                 and vw_flows[i] <= -MIN_ORDER_FLOW_CONFIRM
                 and c_val < opens[i]
                 and body_ratios[i] >= 0.35
             )
 
             if bull_signal and not bear_signal:
-                in_pos = True
-                pos_dir = 1
-                entry_p = c_val
-                pos_atr = atr_val
+                in_pos, pos_dir, entry_p, pos_atr = True, 1, c_val, atr_val
                 struct_dist = entry_p - (sl12[i] - 0.35 * pos_atr)
                 risk_dist = min(max(2.2 * pos_atr, 3.00), max(max(1.2 * pos_atr, 1.50), struct_dist))
-                sl_p = entry_p - risk_dist
-                tp1_p = entry_p + 1.5 * risk_dist
-                tp2_p = entry_p + 2.5 * risk_dist
-                tp3_p = entry_p + 4.0 * risk_dist
-                remaining_weight = 1.0
-                realized_r = 0.0
-                tp1_hit = False
-                tp2_hit = False
-                risk_usd = equity * (risk_pct / 100.0)
-                entry_time = idx_list[i]
+                sl_p, tp1_p, tp2_p, tp3_p = entry_p - risk_dist, entry_p + 1.5 * risk_dist, entry_p + 2.5 * risk_dist, entry_p + 4.0 * risk_dist
+                remaining_weight, realized_r, tp1_hit, tp2_hit = 1.0, 0.0, False, False
+                risk_usd, entry_time = equity * (risk_pct / 100.0), idx_list[i]
             elif bear_signal and not bull_signal:
-                in_pos = True
-                pos_dir = -1
-                entry_p = c_val
-                pos_atr = atr_val
+                in_pos, pos_dir, entry_p, pos_atr = True, -1, c_val, atr_val
                 struct_dist = (sh12[i] + 0.35 * pos_atr) - entry_p
                 risk_dist = min(max(2.2 * pos_atr, 3.00), max(max(1.2 * pos_atr, 1.50), struct_dist))
-                sl_p = entry_p + risk_dist
-                tp1_p = entry_p - 1.5 * risk_dist
-                tp2_p = entry_p - 2.5 * risk_dist
-                tp3_p = entry_p - 4.0 * risk_dist
-                remaining_weight = 1.0
-                realized_r = 0.0
-                tp1_hit = False
-                tp2_hit = False
-                risk_usd = equity * (risk_pct / 100.0)
-                entry_time = idx_list[i]
+                sl_p, tp1_p, tp2_p, tp3_p = entry_p + risk_dist, entry_p - 1.5 * risk_dist, entry_p - 2.5 * risk_dist, entry_p - 4.0 * risk_dist
+                remaining_weight, realized_r, tp1_hit, tp2_hit = 1.0, 0.0, False, False
+                risk_usd, entry_time = equity * (risk_pct / 100.0), idx_list[i]
 
     total_trades = wins + losses
     win_rate = (wins / (total_trades + EPSILON)) * 100.0 if total_trades > 0 else 0.0
     expectancy_r = (total_r / (total_trades + EPSILON)) if total_trades > 0 else 0.0
-
     if total_trades == 0:
         profit_factor = 0.0
     elif gross_loss < 1e-6:
         profit_factor = min(9.99, gross_profit / (1.0 + EPSILON)) if gross_profit > 0 else 0.0
     else:
         profit_factor = gross_profit / (gross_loss + EPSILON)
-
-    net_ret = ((equity - initial_capital) / (initial_capital + EPSILON)) * 100.0
 
     return GridSearchResult(
         optimal_atr_period=atr_period,
@@ -1743,7 +1469,7 @@ def _simulate_strategy_backtest(
         max_drawdown=round(max_drawdown_pct, 2),
         expectancy_r=round(expectancy_r, 2),
         total_trades=total_trades,
-        net_return_pct=round(net_ret, 2),
+        net_return_pct=round(((equity - initial_capital) / (initial_capital + EPSILON)) * 100.0, 2),
         equity_curve=equity_curve,
         timestamps=timestamps,
         trade_log=trade_log,
@@ -1751,23 +1477,13 @@ def _simulate_strategy_backtest(
 
 
 def run_grid_search_optimization(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> GridSearchResult:
-    """Selects optimal (ATR period, Z-Threshold) yielding highest Profit Factor."""
-    candidates: List[GridSearchResult] = []
-    for atr_p in ATR_PERIOD_GRID:
-        for z_thresh in Z_THRESHOLD_GRID:
-            candidates.append(_simulate_strategy_backtest(df_15m, df_1h, atr_p, z_thresh))
-
+    candidates = [_simulate_strategy_backtest(df_15m, df_1h, atr_p, z_t) for atr_p in ATR_PERIOD_GRID for z_t in Z_THRESHOLD_GRID]
     viable = [c for c in candidates if c.total_trades >= 4]
     pool = viable if viable else candidates
-
-    best = max(
-        pool,
-        key=lambda c: (c.profit_factor, c.expectancy_r, c.win_rate, -c.max_drawdown),
-    )
+    best = max(pool, key=lambda c: (c.profit_factor, c.expectancy_r, c.win_rate, -c.max_drawdown))
     logger.info(
-        f"Grid Search Optimal Selected: ATR={best.optimal_atr_period}, "
-        f"Z={best.optimal_z_threshold:.1f} | Trades={best.total_trades} | "
-        f"WR={best.win_rate:.1f}% | PF={best.profit_factor:.2f} | "
+        f"Grid Search Optimal Selected: ATR={best.optimal_atr_period}, Z={best.optimal_z_threshold:.1f} | "
+        f"Trades={best.total_trades} | WR={best.win_rate:.1f}% | PF={best.profit_factor:.2f} | "
         f"MDD={best.max_drawdown:.1f}% | Exp={best.expectancy_r:+.2f}R"
     )
     return best
@@ -1776,15 +1492,8 @@ def run_grid_search_optimization(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> G
 # ==============================================================================
 # MATPLOTLIB BACKTEST CHART GENERATION (HEADLESS AGG)
 # ==============================================================================
-def generate_backtest_chart(
-    df_15m: pd.DataFrame,
-    grid_res: GridSearchResult,
-    chart_path: str = CHART_PATH,
-) -> str:
-    """Renders multi-panel equity & Z-Score chart safely on headless Linux runners."""
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(12, 7.8), gridspec_kw={"height_ratios": [2.2, 1.0]}, facecolor="#0B0F19"
-    )
+def generate_backtest_chart(df_15m: pd.DataFrame, grid_res: GridSearchResult, chart_path: str = CHART_PATH) -> str:
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7.8), gridspec_kw={"height_ratios": [2.2, 1.0]}, facecolor="#0B0F19")
 
     ax1.set_facecolor("#111827")
     eq_times = pd.to_datetime(grid_res.timestamps)
@@ -1798,13 +1507,10 @@ def generate_backtest_chart(
 
     ax1.set_title(
         f"APEX-QUANT-OMNI {ENGINE_VERSION} | XAUUSD Sniper Grid-Optimized Performance\n"
-        f"Optimal ATR={grid_res.optimal_atr_period} | Z-Thresh={grid_res.optimal_z_threshold:.1f} | "
-        f"Trades={grid_res.total_trades} | Win Rate={grid_res.win_rate:.1f}% | "
-        f"PF={grid_res.profit_factor:.2f} | Max DD={grid_res.max_drawdown:.1f}% | Exp={grid_res.expectancy_r:+.2f}R",
-        color="#F9FAFB",
-        fontsize=10.5,
-        fontweight="bold",
-        pad=12,
+        f"ATR={grid_res.optimal_atr_period} | Z={grid_res.optimal_z_threshold:.1f} | "
+        f"Trades={grid_res.total_trades} | WR={grid_res.win_rate:.1f}% | "
+        f"PF={grid_res.profit_factor:.2f} | MDD={grid_res.max_drawdown:.1f}% | Exp={grid_res.expectancy_r:+.2f}R",
+        color="#F9FAFB", fontsize=10.5, fontweight="bold", pad=12,
     )
     ax1.set_ylabel("Account Equity (USD)", color="#D1D5DB", fontsize=10)
     ax1.tick_params(colors="#9CA3AF", labelsize=9)
@@ -1814,20 +1520,8 @@ def generate_backtest_chart(
     ax2.set_facecolor("#111827")
     z_tail = compute_rolling_zscore(df_15m["Close"], window=20).tail(250)
     ax2.plot(z_tail.index, z_tail.values, color="#38BDF8", linewidth=1.5, label="Rolling Z-Score (20)")
-    ax2.axhline(
-        grid_res.optimal_z_threshold,
-        color="#EF4444",
-        linestyle="--",
-        linewidth=1.1,
-        label=f"+Z Threshold ({grid_res.optimal_z_threshold:.1f})",
-    )
-    ax2.axhline(
-        -grid_res.optimal_z_threshold,
-        color="#10B981",
-        linestyle="--",
-        linewidth=1.1,
-        label=f"-Z Threshold (-{grid_res.optimal_z_threshold:.1f})",
-    )
+    ax2.axhline(grid_res.optimal_z_threshold, color="#EF4444", linestyle="--", linewidth=1.1, label=f"+Z ({grid_res.optimal_z_threshold:.1f})")
+    ax2.axhline(-grid_res.optimal_z_threshold, color="#10B981", linestyle="--", linewidth=1.1, label=f"-Z (-{grid_res.optimal_z_threshold:.1f})")
     ax2.axhline(0.0, color="#6B7280", linestyle="-", linewidth=0.7, alpha=0.6)
     ax2.set_ylabel("Z-Score", color="#D1D5DB", fontsize=10)
     ax2.tick_params(colors="#9CA3AF", labelsize=9)
@@ -1857,7 +1551,6 @@ def update_auto_trailing_stop_engine(
     tp3: float,
     db_path: str = DB_PATH,
 ) -> str:
-    """Monitors open positions in SQLite; shifts SL to Breakeven at TP1 + ATR trailing."""
     init_sqlite_db(db_path)
     now_iso = datetime.now(timezone.utc).isoformat()
     conn = sqlite3.connect(db_path)
@@ -1878,25 +1571,16 @@ def update_auto_trailing_stop_engine(
             if direction == "BUY":
                 peak_fav = max(peak_fav, current_price)
                 if current_price <= curr_sl:
-                    cur.execute(
-                        "UPDATE active_positions SET status = 'CLOSED_SL', updated_utc = ? WHERE id = ?",
-                        (now_iso, pos_id),
-                    )
+                    cur.execute("UPDATE active_positions SET status = 'CLOSED_SL', updated_utc = ? WHERE id = ?", (now_iso, pos_id))
                     protocol_status = f"Prior BUY Closed @ SL {curr_sl:.2f} | Ready @ TP1 Breakeven"
                 elif current_price >= pos_tp3:
-                    cur.execute(
-                        "UPDATE active_positions SET status = 'CLOSED_TP3', updated_utc = ? WHERE id = ?",
-                        (now_iso, pos_id),
-                    )
+                    cur.execute("UPDATE active_positions SET status = 'CLOSED_TP3', updated_utc = ? WHERE id = ?", (now_iso, pos_id))
                     protocol_status = f"Prior BUY Hit TP3 {pos_tp3:.2f} (4.0R)"
                 else:
                     if current_price >= pos_tp1 and tp1_hit == 0:
-                        tp1_hit = 1
-                        curr_sl = max(curr_sl, pos_entry)
+                        tp1_hit, curr_sl = 1, max(curr_sl, pos_entry)
                     if tp1_hit == 1:
-                        new_trail = max(pos_entry, peak_fav - atr_step)
-                        if new_trail > curr_sl:
-                            curr_sl = round(new_trail, 2)
+                        curr_sl = round(max(curr_sl, max(pos_entry, peak_fav - atr_step)), 2)
                         protocol_status = f"Breakeven+ATR Trailing Active (SL @ {curr_sl:.2f})"
                     cur.execute(
                         "UPDATE active_positions SET current_sl = ?, tp1_hit = ?, peak_favorable_price = ?, updated_utc = ? WHERE id = ?",
@@ -1905,25 +1589,16 @@ def update_auto_trailing_stop_engine(
             else:
                 peak_fav = min(peak_fav, current_price)
                 if current_price >= curr_sl:
-                    cur.execute(
-                        "UPDATE active_positions SET status = 'CLOSED_SL', updated_utc = ? WHERE id = ?",
-                        (now_iso, pos_id),
-                    )
+                    cur.execute("UPDATE active_positions SET status = 'CLOSED_SL', updated_utc = ? WHERE id = ?", (now_iso, pos_id))
                     protocol_status = f"Prior SELL Closed @ SL {curr_sl:.2f} | Ready @ TP1 Breakeven"
                 elif current_price <= pos_tp3:
-                    cur.execute(
-                        "UPDATE active_positions SET status = 'CLOSED_TP3', updated_utc = ? WHERE id = ?",
-                        (now_iso, pos_id),
-                    )
+                    cur.execute("UPDATE active_positions SET status = 'CLOSED_TP3', updated_utc = ? WHERE id = ?", (now_iso, pos_id))
                     protocol_status = f"Prior SELL Hit TP3 {pos_tp3:.2f} (4.0R)"
                 else:
                     if current_price <= pos_tp1 and tp1_hit == 0:
-                        tp1_hit = 1
-                        curr_sl = min(curr_sl, pos_entry)
+                        tp1_hit, curr_sl = 1, min(curr_sl, pos_entry)
                     if tp1_hit == 1:
-                        new_trail = min(pos_entry, peak_fav + atr_step)
-                        if new_trail < curr_sl:
-                            curr_sl = round(new_trail, 2)
+                        curr_sl = round(min(curr_sl, min(pos_entry, peak_fav + atr_step)), 2)
                         protocol_status = f"Breakeven+ATR Trailing Active (SL @ {curr_sl:.2f})"
                     cur.execute(
                         "UPDATE active_positions SET current_sl = ?, tp1_hit = ?, peak_favorable_price = ?, updated_utc = ? WHERE id = ?",
@@ -1933,27 +1608,21 @@ def update_auto_trailing_stop_engine(
         if "VERIFIED" in new_signal_decision:
             new_dir = "BUY" if "BUY" in new_signal_decision else "SELL"
             cur.execute("SELECT id, direction FROM active_positions WHERE status = 'OPEN'")
-            existing_open = cur.fetchall()
-            if not any(r[1] == new_dir for r in existing_open):
+            if not any(r[1] == new_dir for r in cur.fetchall()):
                 cur.execute(
                     """
                     INSERT INTO active_positions (
                         opened_utc, direction, entry_price, initial_sl, current_sl,
-                        tp1, tp2, tp3, atr_at_entry, tp1_hit, peak_favorable_price,
-                        status, updated_utc
+                        tp1, tp2, tp3, atr_at_entry, tp1_hit, peak_favorable_price, status, updated_utc
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'OPEN', ?)
                     """,
-                    (
-                        now_iso, new_dir, entry_price, sl, sl,
-                        tp1, tp2, tp3, current_atr, entry_price, now_iso,
-                    ),
+                    (now_iso, new_dir, entry_price, sl, sl, tp1, tp2, tp3, current_atr, entry_price, now_iso),
                 )
                 protocol_status = "Active @ TP1 Breakeven"
 
         conn.commit()
     finally:
         conn.close()
-
     return protocol_status
 
 
@@ -1961,7 +1630,6 @@ def update_auto_trailing_stop_engine(
 # MASTER SNIPER SIGNAL SYNTHESIS & INSTITUTIONAL WEBHOOK FORMATTING
 # ==============================================================================
 def run_full_quant_evaluation(command_listener_status: str = "Active / Ready for /check") -> SignalReport:
-    """Executes the Sniper Precision 5-Pillar + ADX + Anti-Chasing + Grid Search pipeline."""
     df_15m, df_1h, data_source, spot_quote = fetch_xauusd_mtf_data()
     session_status = evaluate_market_session(spot_quote=spot_quote)
     news_status = evaluate_news_governor()
@@ -1972,12 +1640,9 @@ def run_full_quant_evaluation(command_listener_status: str = "Active / Ready for
     p1 = analyze_pillar_1_smc(df_15m)
     p2 = analyze_pillar_2_order_flow(df_15m)
     p4 = analyze_pillar_4_mtf_harmony(df_15m, df_1h)
-    p3 = analyze_pillar_3_zscore_sniper(
-        df_15m, z_threshold=grid_res.optimal_z_threshold, macro_bias=p4["bias"]
-    )
+    p3 = analyze_pillar_3_zscore_sniper(df_15m, z_threshold=grid_res.optimal_z_threshold, macro_bias=p4["bias"])
 
-    bull_score = 0
-    bear_score = 0
+    bull_score, bear_score = 0, 0
     for pillar in (p1, p2, p3, p4):
         if pillar["bias"] == "BULLISH":
             bull_score += pillar["points"]
@@ -2001,11 +1666,7 @@ def run_full_quant_evaluation(command_listener_status: str = "Active / Ready for
     total_bear = min(100, bear_score + (p5["points"] if dominant_dir == "BEARISH" else 0))
     confluence_score = max(total_bull, total_bear)
 
-    required_score = (
-        ASIAN_SESSION_MIN_SCORE
-        if session_status.session_name == "ASIAN_SESSION_ACTIVE"
-        else CONFLUENCE_THRESHOLD
-    )
+    required_score = ASIAN_SESSION_MIN_SCORE if session_status.session_name == "ASIAN_SESSION_ACTIVE" else CONFLUENCE_THRESHOLD
 
     adx_val = float(p4["adx_15m"])
     ext_atr = float(p3["ema20_dist_atr"])
@@ -2014,8 +1675,9 @@ def run_full_quant_evaluation(command_listener_status: str = "Active / Ready for
     is_sweep = bool(p1.get("is_sweep", False))
 
     sniper_blocks: List[str] = []
-    raw_dir = "BUY" if (total_bull >= required_score and total_bull > total_bear + 8) else (
-        "SELL" if (total_bear >= required_score and total_bear > total_bull + 8) else "NONE"
+    raw_dir = (
+        "BUY" if (total_bull >= required_score and total_bull > total_bear + 8)
+        else ("SELL" if (total_bear >= required_score and total_bear > total_bull + 8) else "NONE")
     )
 
     if raw_dir == "NONE":
@@ -2026,17 +1688,14 @@ def run_full_quant_evaluation(command_listener_status: str = "Active / Ready for
             sniper_blocks.append(f"WeakBullFlow({vw_flow:+.2f})")
         if raw_dir == "SELL" and vw_flow > -MIN_ORDER_FLOW_CONFIRM:
             sniper_blocks.append(f"WeakBearFlow({vw_flow:+.2f})")
-
         if raw_dir == "BUY" and trigger_dir != "BULLISH":
             sniper_blocks.append("NoBullCandleClose")
         if raw_dir == "SELL" and trigger_dir != "BEARISH":
             sniper_blocks.append("NoBearCandleClose")
-
         if raw_dir == "BUY" and ext_atr > MAX_EXTENSION_ATR:
             sniper_blocks.append(f"OverextendedHigh(+{ext_atr:.2f}ATR)")
         if raw_dir == "SELL" and ext_atr < -MAX_EXTENSION_ATR:
             sniper_blocks.append(f"OverextendedLow({ext_atr:.2f}ATR)")
-
         if adx_val < ADX_TREND_MIN and not is_sweep:
             sniper_blocks.append(f"ChopRegime(ADX={adx_val:.1f} below {ADX_TREND_MIN})")
 
@@ -2058,12 +1717,9 @@ def run_full_quant_evaluation(command_listener_status: str = "Active / Ready for
         tp3=p5["tp3"],
     )
 
-    now_utc = datetime.now(timezone.utc).isoformat()
-    candle_ts = df_15m.index[-1].isoformat()
-
     return SignalReport(
-        timestamp_utc=now_utc,
-        candle_timestamp_utc=candle_ts,
+        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+        candle_timestamp_utc=df_15m.index[-1].isoformat(),
         asset=ASSET_LABEL,
         data_source=data_source,
         spot_quote=spot_quote,
@@ -2095,18 +1751,11 @@ def run_full_quant_evaluation(command_listener_status: str = "Active / Ready for
         expectancy_r=grid_res.expectancy_r,
         command_listener_status=command_listener_status,
         webhook_status="Delivered via Exponential Backoff",
-        pillar_breakdown={
-            "P1_SMC": p1,
-            "P2_OrderFlow": p2,
-            "P3_ZScore": p3,
-            "P4_MTFHarmony": p4,
-            "P5_ATRRisk": p5,
-        },
+        pillar_breakdown={"P1_SMC": p1, "P2_OrderFlow": p2, "P3_ZScore": p3, "P4_MTFHarmony": p4, "P5_ATRRisk": p5},
     )
 
 
 def format_institutional_telegram_report(report: SignalReport) -> str:
-    """Formats the HTML-escaped institutional forensic template for Telegram."""
     bbo_line = (
         f"• <i>Live Spot BBO:</i> Bid {report.spot_quote.bid:.2f} / "
         f"Ask {report.spot_quote.ask:.2f} (Spread ${report.spot_quote.spread:.2f})\n"
@@ -2256,10 +1905,6 @@ def _build_audit_history_message() -> str:
 
 
 def process_telegram_commands(poll_timeout: int = 0) -> int:
-    """
-    Polls Telegram `getUpdates` via POST JSON (with 409 conflict recovery)
-    and deduplicates stacked identical commands within the same polling batch.
-    """
     if not TELEGRAM_BOT_TOKEN:
         logger.info("TELEGRAM_BOT_TOKEN missing; skipping 2-way command polling.")
         return 0
@@ -2268,11 +1913,7 @@ def process_telegram_commands(poll_timeout: int = 0) -> int:
     offset = int(last_offset_str) if last_offset_str.isdigit() else 0
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    payload: Dict[str, Any] = {
-        "offset": offset,
-        "timeout": poll_timeout,
-        "allowed_updates": ["message"],
-    }
+    payload: Dict[str, Any] = {"offset": offset, "timeout": poll_timeout, "allowed_updates": ["message"]}
     resp = request_with_exponential_backoff(
         "POST", url, max_retries=2, backoff_delays=(2, 4), timeout=poll_timeout + 10, json=payload
     )
@@ -2298,7 +1939,6 @@ def process_telegram_commands(poll_timeout: int = 0) -> int:
     if updates:
         logger.info(f"Telegram 2-Way Listener fetched {len(updates)} pending update(s).")
 
-    # Collect authorized unique commands in batch (prevents 3x redundant /check evaluations)
     queued_commands: List[Tuple[str, str]] = []
     seen_pairs: Set[Tuple[str, str]] = set()
 
@@ -2315,10 +1955,7 @@ def process_telegram_commands(poll_timeout: int = 0) -> int:
             continue
 
         if TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
-            logger.warning(
-                f"Ignored unauthorized Telegram command from chat_id={chat_id} "
-                f"(expected={TELEGRAM_CHAT_ID})"
-            )
+            logger.warning(f"Ignored unauthorized Telegram command from chat_id={chat_id}")
             continue
 
         raw_token = text.split()[0].split("@")[0].lower()
@@ -2384,7 +2021,6 @@ def process_telegram_commands(poll_timeout: int = 0) -> int:
 # EXECUTION ORCHESTRATION (ONESHOT SERVERLESS & CONTINUOUS 2-WAY POLLING)
 # ==============================================================================
 def execute_scheduled_cycle(force_notify: bool = False) -> None:
-    """Runs one complete serverless cycle with Session/Spread/News/Sniper gates."""
     init_sqlite_db(DB_PATH)
     process_telegram_commands(poll_timeout=0)
 
@@ -2425,7 +2061,6 @@ def execute_scheduled_cycle(force_notify: bool = False) -> None:
 
 
 def run_continuous_polling_loop(scan_interval_sec: int = 900) -> None:
-    """Runs persistent 2-way Telegram listener with periodic 15-minute scans."""
     logger.info(f"Starting continuous 2-Way Telegram Listener + {scan_interval_sec}s scan loop...")
     last_scan_ts = 0.0
     while True:
@@ -2439,3 +2074,42 @@ def run_continuous_polling_loop(scan_interval_sec: int = 900) -> None:
             logger.info("Graceful shutdown requested.")
             break
         except Exception as exc:
+            logger.error(f"Error inside continuous loop: {exc}")
+            send_emergency_telegram_alert("Continuous Polling Loop", exc)
+            time.sleep(10)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=f"APEX-QUANT-OMNI SOVEREIGN {ENGINE_VERSION} XAUUSD Sniper Engine"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["oneshot", "poll", "commands_only"],
+        default=os.getenv("BOT_MODE", "oneshot"),
+        help="Execution mode: oneshot (GitHub Actions), poll (24/7 listener), commands_only",
+    )
+    parser.add_argument(
+        "--force-notify",
+        action="store_true",
+        default=os.getenv("FORCE_NOTIFY", "false").lower() == "true",
+        help="Force webhook delivery even on NEUTRAL or suppressed session (manual diagnostic).",
+    )
+    args = parser.parse_args()
+
+    try:
+        if args.mode == "poll":
+            run_continuous_polling_loop()
+        elif args.mode == "commands_only":
+            count = process_telegram_commands(poll_timeout=2)
+            logger.info(f"Processed {count} interactive Telegram command(s).")
+        else:
+            execute_scheduled_cycle(force_notify=args.force_notify)
+    except Exception as exc:
+        logger.critical(f"Fatal unhandled exception in APEX-QUANT-OMNI: {exc}", exc_info=True)
+        send_emergency_telegram_alert("Top-Level Engine Execution", exc)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
