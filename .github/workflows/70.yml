@@ -1,21 +1,20 @@
-name: APEX-QUANT-OMNI SOVEREIGN v75.2 (XAUUSD Signal & News Guard Bot)
+name: APEX-QUANT-OMNI Sovereign XAUUSD Bot
 
 on:
   schedule:
-    # Runs every 15 minutes aligned with the 15M execution timeframe
     - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
-      mode:
-        description: "Execution mode (oneshot | commands_only)"
+      bot_mode:
+        description: "Execution mode (oneshot or polling)"
         required: true
         default: "oneshot"
         type: choice
         options:
           - oneshot
-          - commands_only
+          - polling
       force_notify:
-        description: "Force Telegram & Discord diagnostic report even if NEUTRAL/suppressed"
+        description: "Force Telegram/Discord report even on HOLD/Blackout"
         required: true
         default: "false"
         type: choice
@@ -24,69 +23,65 @@ on:
           - "true"
 
 permissions:
-  contents: read
   actions: read
-
-concurrency:
-  group: apex-quant-omni-xauusd-${{ github.ref }}
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  quant-signal-engine:
-    name: Run XAUUSD Quant Engine & Forensic Audit
+  run-signal-engine:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set Up Python 3.11
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-          cache-dependency-path: "requirements.txt"
 
-      - name: Install Dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore Latest SQLite State Artifact (If Available)
+      - name: Restore SQLite state from latest artifact
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RUN_ID=$(gh run list --repo "${{ github.repository }}" --workflow="signal_bot.yml" --status=success --limit=1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+          RUN_ID=$(gh run list --workflow="signal_bot.yml" --status=success --limit=1 --json databaseId --jq '.[0].databaseId // empty')
           if [ -n "$RUN_ID" ]; then
-            gh run download "$RUN_ID" --repo "${{ github.repository }}" -n apex-quant-forensic-artifacts -D . || true
+            gh run download "$RUN_ID" --name apex-quant-artifacts --dir . || true
+            ls -la trading_signals.db backtest_performance.png 2>/dev/null || true
           fi
 
-      - name: Execute APEX-QUANT-OMNI Sovereign Engine
+      - name: Run APEX-QUANT-OMNI Engine
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           ACCOUNT_BALANCE: "10000.0"
           RISK_PERCENT: "1.0"
-          CONFLUENCE_THRESHOLD: "65"
+          CONFLUENCE_THRESHOLD: "68"
           MAX_ALLOWED_SPREAD_USD: "3.00"
           NEWS_BLACKOUT_BEFORE_MIN: "45"
           NEWS_BLACKOUT_AFTER_MIN: "30"
-          BOT_MODE: ${{ github.event.inputs.mode || 'oneshot' }}
+          NEWS_CACHE_TTL_MINUTES: "15"
+          BOT_MODE: ${{ github.event.inputs.bot_mode || 'oneshot' }}
           FORCE_NOTIFY: ${{ github.event.inputs.force_notify || 'false' }}
           MPLBACKEND: "Agg"
         run: |
           python bot.py --mode "${BOT_MODE}"
 
-      - name: Upload Forensic SQLite DB & Backtest Chart Artifacts
+      - name: Upload Forensic Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: apex-quant-forensic-artifacts
+          name: apex-quant-artifacts
           path: |
             trading_signals.db
             backtest_performance.png
-          retention-days: 30
           if-no-files-found: warn
+          retention-days: 14
