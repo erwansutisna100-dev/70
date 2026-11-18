@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-APEX-QUANT-OMNI SOVEREIGN (v75.7)
+APEX-QUANT-OMNI SOVEREIGN (v75.9)
 Institutional-Grade Spot Gold (XAUUSD) Quantitative Signal & Execution Engine
-Weighted 5-Pillar Harmonic SniperGate (Market Structure & Order Flow Priority)
-Real-Time Economic Calendar Scraper (ForexFactory + Investing.com) + Hard Blackout Governor
+Weighted SniperGate: SMC 35% | Order Flow 30% | Z-Score 15% | ATR/Vol 10% | MTF 10%
+Real-Time Economic Calendar Scraper + Hard Blackout + Clean Telegram Cards
 """
 
 import os
@@ -38,7 +38,7 @@ logger = logging.getLogger("APEX-QUANT-OMNI")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-BOT_VERSION = "v75.7"
+BOT_VERSION = "v75.9"
 EPSILON = 1e-8
 DB_PATH = os.getenv("SQLITE_DB_PATH", "trading_signals.db")
 CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
@@ -63,14 +63,15 @@ MIN_PRIORITY_PILLAR_NORM = 60.0
 WIB_TZ = timezone(timedelta(hours=7))
 NY_TZ = ZoneInfo("America/New_York")
 
-# Priority-weighted 5-pillar harmonic weights (sum = 1.00; SMC + Order Flow = 58%)
+# SniperGate Confluence Weights (Exact Sum = 1.00 / 100%)
 PILLAR_WEIGHTS = {
-    "smc": 0.30,
-    "order_flow": 0.28,
-    "mtf": 0.18,
-    "zscore": 0.14,
-    "regime": 0.10,
+    "smc": 0.35,         # Market Structure (SMC BOS/Sweep/FVG): 35%
+    "order_flow": 0.30,  # Order Flow Momentum & Delta: 30%
+    "zscore": 0.15,      # Z-Score Pullback & Anti-Chasing: 15%
+    "atr_vol": 0.10,     # ATR/Volatility Expansion & Trigger: 10%
+    "mtf": 0.10,         # Multi-Timeframe 1H/15M Harmony: 10%
 }
+assert abs(sum(PILLAR_WEIGHTS.values()) - 1.0) < 1e-9, "PILLAR_WEIGHTS must sum to 1.00"
 
 CRITICAL_NEWS_KEYWORDS = (
     "non-farm", "nonfarm", "nfp", "fomc", "federal funds", "interest rate",
@@ -100,6 +101,13 @@ def format_utc_wib(dt_utc: datetime) -> str:
     dt_utc = dt_utc.astimezone(timezone.utc)
     dt_wib = dt_utc.astimezone(WIB_TZ)
     return f"{dt_utc.strftime('%H:%M UTC')} / {dt_wib.strftime('%H:%M WIB')}"
+
+
+def _format_minutes_human(total_min: float) -> str:
+    m = max(0, int(round(total_min)))
+    if m >= 60:
+        return f"{m // 60}j {m % 60}m"
+    return f"{m}m"
 
 
 # ==============================================================================
@@ -679,6 +687,8 @@ def compute_indicators(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
     out["ATR"] = tr.ewm(alpha=1.0 / atr_period, adjust=False).mean().clip(lower=EPSILON)
+    out["ATR_MA20"] = out["ATR"].rolling(20).mean().bfill().clip(lower=EPSILON)
+    out["ATR_RATIO"] = (out["ATR"] / out["ATR_MA20"]).fillna(1.0)
 
     # Wilder ADX(14)
     up_move = high.diff()
@@ -711,7 +721,7 @@ def compute_indicators(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
 
 def _evaluate_smc_pillar(df: pd.DataFrame, idx: int) -> tuple[float, str, str, float, float]:
     """
-    Pillar 1 (Normalized 0-100, Weight 30%):
+    Pillar 1 (Normalized 0-100, Weight 35%):
     SMC Liquidity Sweep, Break of Structure (BOS), Fair Value Gap (FVG), & Swing Structure.
     """
     w = df.iloc[max(0, idx - 35): idx + 1]
@@ -757,12 +767,12 @@ def score_bar_confluence(
     z_threshold: float,
 ) -> dict:
     """
-    Weight-Based 5-Pillar Harmonic Confluence Scoring Engine (0-100):
-    - Pillar 1: SMC Market Structure (30%)
-    - Pillar 2: Order Flow Momentum & Absorption (28%)
-    - Pillar 3: Multi-Timeframe 1H/15M Harmony (18%)
-    - Pillar 4: Z-Score Pullback & Anti-Chasing (14%)
-    - Pillar 5: ADX Regime & Trigger Candle (10%)
+    Weighted SniperGate Confluence Engine (Sum = 100%):
+    - SMC (Market Structure):  35% (0.35)
+    - Order Flow Momentum:     30% (0.30)
+    - Z-Score Pullback:        15% (0.15)
+    - ATR/Volatility Regime:   10% (0.10)
+    - MTF Harmony (1H/15M):    10% (0.10)
     """
     row = df15.iloc[idx15]
     ts = df15.index[idx15]
@@ -773,15 +783,16 @@ def score_bar_confluence(
     ema20 = float(row["EMA20"])
     ema50 = float(row["EMA50"])
     atr = max(float(row["ATR"]), EPSILON)
+    atr_ratio = float(row["ATR_RATIO"])
     adx = float(row["ADX"])
     z = float(row["ZSCORE"])
     of = float(row["ORDER_FLOW"])
     of_mom = float(row["OF_MOMENTUM"])
 
-    # Pillar 1: Market Structure (Normalized 0-100, Weight 30%)
+    # 1. SMC (Market Structure) - Weight 35%
     smc_norm, smc_state, smc_dir, swing_low, swing_high = _evaluate_smc_pillar(df15, idx15)
 
-    # Pillar 3: Multi-Timeframe Bias & Harmony (Normalized 0-100, Weight 18%)
+    # 2. MTF Harmony (1H/15M) - Weight 10%
     h1_bull = float(h1_row["EMA20"]) > float(h1_row["EMA50"]) and float(h1_row["Close"]) > float(h1_row["EMA50"])
     h1_bear = float(h1_row["EMA20"]) < float(h1_row["EMA50"]) and float(h1_row["Close"]) < float(h1_row["EMA50"])
     m15_bull = ema20 > ema50
@@ -789,11 +800,11 @@ def score_bar_confluence(
 
     if h1_bull and m15_bull:
         bias = "BUY"
-        mtf_norm = 100.0 if adx >= 20.0 else 78.0
+        mtf_norm = 100.0 if adx >= 20.0 else 80.0
         mtf_state = "1H_15M_FULL_BULL_HARMONY"
     elif h1_bear and m15_bear:
         bias = "SELL"
-        mtf_norm = 100.0 if adx >= 20.0 else 78.0
+        mtf_norm = 100.0 if adx >= 20.0 else 80.0
         mtf_state = "1H_15M_FULL_BEAR_HARMONY"
     elif h1_bull and smc_dir == "BUY":
         bias = "BUY"
@@ -808,11 +819,10 @@ def score_bar_confluence(
         mtf_norm = 25.0
         mtf_state = "MTF_DIVERGENCE"
 
-    # Penalize SMC if Market Structure opposes dominant direction
     if smc_dir != "NONE" and smc_dir != bias:
         smc_norm = max(15.0, smc_norm - 55.0)
 
-    # Pillar 2: Order Flow Momentum & Delta Confirmation (Normalized 0-100, Weight 28%)
+    # 3. Order Flow Momentum & Delta - Weight 30%
     of_aligned = of if bias == "BUY" else -of
     mom_accel = (of_mom >= 0.02) if bias == "BUY" else (of_mom <= -0.02)
     if of_aligned >= 0.35:
@@ -828,7 +838,7 @@ def score_bar_confluence(
         of_norm = 10.0
         of_label = f"COUNTER_ORDERFLOW ({of:+.2f}, Δ{of_mom:+.2f})"
 
-    # Pillar 4: Z-Score Pullback & Anti-Chasing Extension (Normalized 0-100, Weight 14%)
+    # 4. Z-Score Pullback & Anti-Chasing - Weight 15%
     ext_atr = (close - ema20) / atr
     if bias == "BUY":
         if -1.0 <= z <= 0.8 and abs(ext_atr) <= MAX_EXTENSION_ATR:
@@ -849,25 +859,25 @@ def score_bar_confluence(
         else:
             z_norm = 45.0
 
-    # Pillar 5: ADX Regime & Trigger Candle Precision (Normalized 0-100, Weight 10%)
+    # 5. ATR/Volatility Expansion & Trigger Candle - Weight 10%
     candle_bull = float(row["Close"]) > float(row["Open"])
     candle_bear = float(row["Close"]) < float(row["Open"])
     trigger_ok = (bias == "BUY" and candle_bull) or (bias == "SELL" and candle_bear)
-    if adx >= 25.0 and trigger_ok:
-        regime_norm = 100.0
-    elif adx >= 18.0 and trigger_ok:
-        regime_norm = 80.0
-    elif adx >= 18.0:
-        regime_norm = 50.0
+    if 0.80 <= atr_ratio <= 1.80 and adx >= 18.0 and trigger_ok:
+        atr_vol_norm = 100.0
+    elif 0.65 <= atr_ratio <= 2.10 and trigger_ok:
+        atr_vol_norm = 80.0
+    elif 0.65 <= atr_ratio <= 2.10:
+        atr_vol_norm = 55.0
     else:
-        regime_norm = 20.0
+        atr_vol_norm = 25.0
 
     weighted_score = (
         smc_norm * PILLAR_WEIGHTS["smc"]
         + of_norm * PILLAR_WEIGHTS["order_flow"]
-        + mtf_norm * PILLAR_WEIGHTS["mtf"]
         + z_norm * PILLAR_WEIGHTS["zscore"]
-        + regime_norm * PILLAR_WEIGHTS["regime"]
+        + atr_vol_norm * PILLAR_WEIGHTS["atr_vol"]
+        + mtf_norm * PILLAR_WEIGHTS["mtf"]
     )
     total_score = int(round(min(100.0, max(0.0, weighted_score))))
 
@@ -876,8 +886,8 @@ def score_bar_confluence(
     priority_pillars_ok = (smc_norm >= MIN_PRIORITY_PILLAR_NORM) and (of_norm >= MIN_PRIORITY_PILLAR_NORM)
 
     weighted_breakdown = (
-        f"SMC={smc_norm:.0f}(w30) OF={of_norm:.0f}(w28) MTF={mtf_norm:.0f}(w18) "
-        f"Z={z_norm:.0f}(w14) Reg={regime_norm:.0f}(w10)"
+        f"SMC={smc_norm:.0f}(w35) OF={of_norm:.0f}(w30) Z={z_norm:.0f}(w15) "
+        f"ATRVol={atr_vol_norm:.0f}(w10) MTF={mtf_norm:.0f}(w10)"
     )
 
     return {
@@ -891,6 +901,7 @@ def score_bar_confluence(
         "z_score": z,
         "adx": adx,
         "atr": atr,
+        "atr_ratio": atr_ratio,
         "swing_low": swing_low,
         "swing_high": swing_high,
         "trigger_ok": trigger_ok,
@@ -898,9 +909,9 @@ def score_bar_confluence(
         "of_ok": of_ok,
         "smc_norm": smc_norm,
         "of_norm": of_norm,
-        "mtf_norm": mtf_norm,
         "z_norm": z_norm,
-        "regime_norm": regime_norm,
+        "atr_vol_norm": atr_vol_norm,
+        "mtf_norm": mtf_norm,
         "priority_pillars_ok": priority_pillars_ok,
         "weighted_breakdown": weighted_breakdown,
         "ext_atr": ext_atr,
@@ -1135,6 +1146,66 @@ def send_discord_alert(message: str) -> None:
 
 
 # ==============================================================================
+# CLEAN TELEGRAM CARD FORMATTER
+# ==============================================================================
+def build_telegram_signal_card(
+    decision: str,
+    bias: str,
+    sig: dict,
+    req_score: int,
+    bid: float,
+    ask: float,
+    spread_usd: float,
+    entry: float,
+    sl: float,
+    tp1: float,
+    tp2: float,
+    tp3: float,
+    lot_out: float,
+    risk_out: float,
+    sniper_note: str,
+    session_name: str,
+    news_gov: dict,
+    best_bt: dict,
+) -> str:
+    if news_gov["upcoming"]:
+        nxt = news_gov["upcoming"][0]
+        news_short = f"CLEAR ({_esc(nxt['title'])} {_format_minutes_human(nxt['delta_min'])})"
+    else:
+        news_short = "CLEAR"
+
+    if news_gov["hard_blackout"]:
+        ev = news_gov["active_event"]
+        resume_str = format_utc_wib(news_gov["resume_utc"]) if news_gov["resume_utc"] else "-"
+        return (
+            f"⛔ <b>XAUUSD HARD BLACKOUT</b>\n"
+            f"<b>Berita:</b> {_esc(ev['title'])}\n"
+            f"<b>Spot:</b> <code>{bid:.2f} / {ask:.2f}</code> (Spr <code>${spread_usd:.2f}</code>)\n"
+            f"<b>Status:</b> Sinyal BUY/SELL ditangguhkan (anti-slippage)\n"
+            f"<b>Lanjut Est:</b> <code>{_esc(resume_str)}</code>"
+        )
+
+    if decision.startswith("VERIFIED"):
+        icon = "🟢" if bias == "BUY" else "🔴"
+        return (
+            f"{icon} <b>{_esc(decision)} — XAUUSD</b> | Score <code>{sig['score']}/100</code>\n"
+            f"<b>Entry:</b> <code>{entry:.2f}</code> | <b>SL:</b> <code>{sl:.2f}</code>\n"
+            f"<b>TP1:</b> <code>{tp1:.2f}</code> | <b>TP2:</b> <code>{tp2:.2f}</code> | <b>TP3:</b> <code>{tp3:.2f}</code>\n"
+            f"<b>Risk:</b> Lot <code>{lot_out:.2f}</code> (<code>${risk_out:.0f}</code>) | Trailing: <code>TP1 BE</code> | Spr <code>${spread_usd:.2f}</code>\n"
+            f"<b>News:</b> {_esc(news_short)} | <b>BT:</b> WR <code>{best_bt['wr']}%</code> PF <code>{best_bt['pf']}</code>"
+        )
+
+    return (
+        f"🟡 <b>XAUUSD HOLD</b> | Score <code>{sig['score']}/100</code> (Req&gt;={req_score})\n"
+        f"<b>Spot:</b> <code>{bid:.2f} / {ask:.2f}</code> (Spr <code>${spread_usd:.2f}</code>)\n"
+        f"<b>Bias ({_esc(bias)}):</b> {_esc(sniper_note)}\n"
+        f"<b>Sesi:</b> <code>{_esc(session_name)}</code>\n"
+        f"<b>News:</b> {_esc(news_short)}\n"
+        f"<b>BT:</b> WR <code>{best_bt['wr']}%</code> | PF <code>{best_bt['pf']}</code> | Exp <code>{best_bt['exp']:+.2f}R</code>"
+    )
+
+
+# ==============================================================================
 # CORE ANALYSIS CYCLE
 # ==============================================================================
 def run_analysis_cycle(
@@ -1142,6 +1213,7 @@ def run_analysis_cycle(
     notify_mode: str = "auto",
     reply_chat_id: str | None = None,
     force_news_refresh: bool = False,
+    suppress_hold_notify: bool = False,
 ) -> dict:
     now_utc = datetime.now(timezone.utc)
 
@@ -1184,7 +1256,7 @@ def run_analysis_cycle(
     risk_usd = round(ACCOUNT_BALANCE * (RISK_PERCENT / 100.0), 2)
     lot_size = round(max(0.01, min(5.0, risk_usd / max(sl_dist * 100.0, EPSILON))), 2)
 
-    # 5. Dual Governors + Priority-Weighted SniperGate
+    # 5. Dual Governors + Weighted SniperGate
     session_ok, session_reason, session_name, req_score = evaluate_session_governor(now_utc, spread_usd)
 
     if news_gov["hard_blackout"]:
@@ -1197,67 +1269,50 @@ def run_analysis_cycle(
         lot_out, risk_out = 0.0, 0.0
     elif sig["smc_norm"] < MIN_PRIORITY_PILLAR_NORM:
         decision = "NEUTRAL / HOLD"
-        sniper_note = f"Priority SMC Structure weak ({sig['smc_norm']:.0f} below {MIN_PRIORITY_PILLAR_NORM:.0f})"
+        sniper_note = f"SMC Structure lemah ({sig['smc_norm']:.0f}/{MIN_PRIORITY_PILLAR_NORM:.0f})"
         lot_out, risk_out = lot_size, risk_usd
     elif sig["of_norm"] < MIN_PRIORITY_PILLAR_NORM or not sig["of_ok"]:
         decision = "NEUTRAL / HOLD"
-        sniper_note = f"Priority OrderFlow unconfirmed ({sig['order_flow']:+.2f}, norm={sig['of_norm']:.0f})"
+        sniper_note = f"OrderFlow belum terkonfirmasi ({sig['order_flow']:+.2f})"
         lot_out, risk_out = lot_size, risk_usd
     elif sig["score"] < req_score:
         decision = "NEUTRAL / HOLD"
-        sniper_note = f"Weighted Confluence {sig['score']} below Req {req_score}"
+        sniper_note = f"Skor {sig['score']} belum mencapai Req {req_score}"
         lot_out, risk_out = lot_size, risk_usd
     elif sig["adx"] < 18.0:
         decision = "NEUTRAL / HOLD"
-        sniper_note = f"Weak ADX {sig['adx']:.1f} below 18.0"
+        sniper_note = f"ADX lemah ({sig['adx']:.1f} below 18.0)"
         lot_out, risk_out = lot_size, risk_usd
     elif not sig["anti_chase_ok"]:
         decision = "NEUTRAL / HOLD"
-        sniper_note = f"Extended Price ({sig['ext_atr']:+.2f} ATR)"
+        sniper_note = f"Harga overextended ({sig['ext_atr']:+.2f} ATR)"
         lot_out, risk_out = lot_size, risk_usd
     elif not sig["trigger_ok"]:
         decision = "NEUTRAL / HOLD"
-        sniper_note = "Awaiting Trigger Candle close"
+        sniper_note = "Menunggu konfirmasi candle pemicu"
         lot_out, risk_out = lot_size, risk_usd
     else:
         decision = f"VERIFIED {bias}"
         sniper_note = "ALL_WEIGHTED_SNIPER_GATES_PASSED"
         lot_out, risk_out = lot_size, risk_usd
 
-    # 6. Build Telegram HTML Report
-    icon = "🔴" if "SELL" in decision else ("🟢" if "BUY" in decision else ("⛔" if "BLACKOUT" in decision else "🟡"))
-    news_line = _esc(news_gov["status_code"])
-    if news_gov["hard_blackout"] and news_gov["resume_utc"]:
-        news_line += f"\nResume Est: <code>{_esc(format_utc_wib(news_gov['resume_utc']))}</code>"
-    elif news_gov["upcoming"]:
-        nxt = news_gov["upcoming"][0]
-        news_line += f" | Next: {_esc(nxt['title'])} ({int(nxt['delta_min'])}m)"
-
-    msg_html = (
-        f"{icon} <b>APEX-QUANT-OMNI {BOT_VERSION} — XAUUSD SPOT</b>\n"
-        f"<b>Decision:</b> <code>{_esc(decision)}</code> | <b>Weighted Score:</b> <code>{sig['score']}/100</code> (Req&gt;={req_score})\n"
-        f"<b>Pillars:</b> <code>{_esc(sig['weighted_breakdown'])}</code>\n"
-        f"<b>Spot BBO:</b> Bid <code>{bid:.2f}</code> | Ask <code>{ask:.2f}</code> | Spread <code>${spread_usd:.2f}</code>\n"
-        f"<b>Plan ({_esc(bias)}):</b> Entry <code>{entry:.2f}</code> | SL <code>{sl:.2f}</code>\n"
-        f"<b>Targets:</b> TP1 <code>{tp1:.2f}</code> | TP2 <code>{tp2:.2f}</code> | TP3 <code>{tp3:.2f}</code>\n"
-        f"<b>Risk:</b> Lot <code>{lot_out:.2f}</code> | Risk <code>${risk_out:.2f}</code> | Trailing: <code>TP1 Breakeven</code>\n"
-        f"<b>Quant:</b> Z=<code>{sig['z_score']:+.2f}</code> | ADX=<code>{sig['adx']:.1f}</code> | ATR=<code>{atr:.2f}</code>\n"
-        f"<b>SMC/MTF:</b> <code>{_esc(sig['smc_state'])}</code> | <code>{_esc(sig['mtf_state'])}</code>\n"
-        f"<b>OrderFlow:</b> <code>{_esc(sig['of_label'])}</code>\n"
-        f"<b>NewsGov:</b> <code>{news_line}</code>\n"
-        f"<b>SniperGate:</b> <code>{_esc(sniper_note)}</code> | <code>{_esc(session_name)}</code>\n"
-        f"<b>GridSearch:</b> ATR={best_bt['atr']} Z={best_bt['z']} | WR={best_bt['wr']}% PF={best_bt['pf']} Exp={best_bt['exp']:+.2f}R\n"
-        f"<b>Calendar Src:</b> <i>{_esc(news_gov['source'])}</i>\n"
-        f"<b>Price Src:</b> <i>{_esc(data_src)}</i>"
+    # 6. Build Clean Telegram Card
+    msg_html = build_telegram_signal_card(
+        decision=decision, bias=bias, sig=sig, req_score=req_score,
+        bid=bid, ask=ask, spread_usd=spread_usd,
+        entry=entry, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+        lot_out=lot_out, risk_out=risk_out,
+        sniper_note=sniper_note, session_name=session_name,
+        news_gov=news_gov, best_bt=best_bt,
     )
 
-    # 7. Notification Routing
+    # 7. Notification Routing (Avoid Duplicate Send When /check Already Replied)
     is_verified_op = decision.startswith("VERIFIED")
     should_send = (
         notify_mode == "command"
         or is_verified_op
         or news_gov["hard_blackout"]
-        or FORCE_NOTIFY
+        or (FORCE_NOTIFY and not suppress_hold_notify)
     )
 
     webhook_status = "Standby (Hold Threshold)"
@@ -1268,14 +1323,17 @@ def run_analysis_cycle(
         else:
             send_discord_alert(msg_html)
             webhook_status = "Delivered via Exponential Backoff" if ok_tg else "Telegram Delivery Failed"
-    else:
+    elif suppress_hold_notify and FORCE_NOTIFY:
+        webhook_status = "Skipped Duplicate (Already Replied via /check)"
         if not DISCORD_WEBHOOK_URL:
             logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery.")
+    elif not DISCORD_WEBHOOK_URL:
+        logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery.")
 
     if notify_mode != "command" and not DISCORD_WEBHOOK_URL and should_send:
         logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery.")
 
-    # 8. Forensic Audit Log & SQLite Persistence
+    # 8. Full Forensic Audit Log (GitHub Actions Console + SQLite)
     forensic_audit_log(conn, {
         "timestamp_utc": now_utc.isoformat(),
         "decision": decision,
@@ -1300,7 +1358,7 @@ def run_analysis_cycle(
     logger.info(f"Asset=XAUUSD (SPOT GOLD) | Decision={decision} | Score={sig['score']}/100 (Req>={req_score}) | Source={data_src}")
     logger.info(f"WeightedPillars: {sig['weighted_breakdown']}")
     logger.info(f"Entry={entry:.2f} | SL={sl:.2f} | TP1={tp1:.2f} | TP2={tp2:.2f} | TP3={tp3:.2f} | Bid={bid:.2f} Ask={ask:.2f} Spread=${spread_usd:.2f}")
-    logger.info(f"Z-Score={sig['z_score']:.4f} | ADX={sig['adx']:.2f} | ATR={atr:.4f} | SMC={sig['smc_state']} | OrderFlow={sig['of_label']} | MTF={sig['mtf_state']}")
+    logger.info(f"Z-Score={sig['z_score']:.4f} | ADX={sig['adx']:.2f} | ATR={atr:.4f} (Ratio={sig['atr_ratio']:.2f}) | SMC={sig['smc_state']} | OrderFlow={sig['of_label']} | MTF={sig['mtf_state']}")
     logger.info(f"SniperGate={sniper_note} | NewsGovernor={news_gov['status_code']} | NewsSrc={news_gov['source']} | Session={session_name}")
     logger.info(f"GridSearch(ATR={best_bt['atr']}, Z={best_bt['z']}) | WR={best_bt['wr']}% | PF={best_bt['pf']:.2f} | MDD={best_bt['mdd']}% | Exp={best_bt['exp']:+.2f}R")
     logger.info(f"Lot={lot_out:.2f} | RiskUSD=${risk_out:.2f} | Trailing=Active @ TP1 Breakeven | Webhook={webhook_status}")
@@ -1318,49 +1376,43 @@ def _build_news_reply(conn: sqlite3.Connection, force_refresh: bool = True) -> s
     gov = evaluate_news_governor(events, now_utc, src)
 
     lines = [
-        f"📅 <b>USD HIGH-IMPACT CALENDAR ({BOT_VERSION})</b>",
+        f"📅 <b>USD HIGH-IMPACT NEWS ({BOT_VERSION})</b>",
         f"<b>Status:</b> <code>{_esc(gov['status_code'])}</code>",
-        f"<b>Blackout Window:</b> -{NEWS_BLACKOUT_BEFORE_MIN}m / +{NEWS_BLACKOUT_AFTER_MIN}m",
-        f"<b>Source:</b> <i>{_esc(gov['source'])}</i>",
-        "",
+        f"<b>Blackout:</b> -{NEWS_BLACKOUT_BEFORE_MIN}m / +{NEWS_BLACKOUT_AFTER_MIN}m",
     ]
     if gov["hard_blackout"] and gov["resume_utc"]:
-        lines.append(f"⛔ <b>HARD BLACKOUT ACTIVE</b> — Resume: <code>{_esc(format_utc_wib(gov['resume_utc']))}</code>\n")
+        lines.append(f"⛔ <b>Lanjut Est:</b> <code>{_esc(format_utc_wib(gov['resume_utc']))}</code>")
 
     if gov["upcoming"]:
-        lines.append("<b>Upcoming USD High-Impact Events (72h):</b>")
-        for ev in gov["upcoming"][:6]:
-            hrs = int(ev["delta_min"] // 60)
-            mins = int(ev["delta_min"] % 60)
+        lines.append("\n<b>Jadwal Dekat (72j):</b>")
+        for ev in gov["upcoming"][:5]:
             tag = "🔴" if ev["is_tier1"] else "🟠"
             lines.append(
                 f"{tag} <code>{_esc(format_utc_wib(ev['dt_utc']))}</code> "
-                f"(+{hrs}h {mins}m) — <b>{_esc(ev['title'])}</b>"
+                f"(+{_format_minutes_human(ev['delta_min'])}) — {_esc(ev['title'])}"
             )
     else:
-        lines.append("✅ No USD High-Impact events scheduled in the next 72 hours.")
+        lines.append("\n✅ Tidak ada berita High-Impact USD 72 jam ke depan.")
     return "\n".join(lines)
 
 
 def _build_audit_reply(conn: sqlite3.Connection) -> str:
     rows = conn.execute(
-        "SELECT timestamp_utc, decision, score, entry_price, spread_usd, news_status "
+        "SELECT timestamp_utc, decision, score, entry_price, spread_usd "
         "FROM signals_audit ORDER BY id DESC LIMIT 5"
     ).fetchall()
     if not rows:
-        return "📜 No forensic audit records saved in SQLite yet."
-    lines = ["📜 <b>LAST 5 FORENSIC AUDITS</b>"]
-    for ts, dec, sc, ent, spr, nstat in rows:
-        lines.append(
-            f"• <code>{_esc(ts[:16])}Z</code> | <b>{_esc(dec)}</b> ({sc}/100) "
-            f"@ <code>{ent:.2f}</code> (Spr ${spr:.2f}) | <i>{_esc(nstat[:28])}</i>"
-        )
+        return "📜 Belum ada riwayat audit tersimpan."
+    lines = ["📜 <b>5 AUDIT TERAKHIR</b>"]
+    for ts, dec, sc, ent, spr in rows:
+        lines.append(f"• <code>{_esc(ts[11:16])}Z</code> | <b>{_esc(dec)}</b> ({sc}) @ <code>{ent:.2f}</code> (${spr:.2f})")
     return "\n".join(lines)
 
 
-def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -> None:
+def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -> bool:
+    """Processes pending Telegram commands. Returns True if /check already ran and replied."""
     if not TELEGRAM_BOT_TOKEN:
-        return
+        return False
     offset_str = get_state(conn, "tg_update_offset", "0")
     offset = int(offset_str) if offset_str.isdigit() else 0
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
@@ -1381,18 +1433,19 @@ def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -
             )
         if resp.status_code != 200:
             logger.warning(f"Telegram getUpdates HTTP {resp.status_code}")
-            return
+            return False
         updates = resp.json().get("result", [])
     except Exception as exc:
         logger.warning(f"Telegram 2-Way Listener error: {exc}")
-        return
+        return False
 
     if not updates:
-        return
+        return False
 
     logger.info(f"Telegram 2-Way Listener fetched {len(updates)} pending update(s).")
     max_uid = offset
     seen_batch = set()
+    handled_check = False
 
     for upd in updates:
         uid = int(upd.get("update_id", 0))
@@ -1417,6 +1470,7 @@ def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -
         logger.info(f"Processing 2-Way Telegram command [{cmd}] from chat_id=***")
         if cmd == "/check":
             run_analysis_cycle(conn, notify_mode="command", reply_chat_id=chat_id, force_news_refresh=True)
+            handled_check = True
         elif cmd == "/news":
             send_telegram_message(_build_news_reply(conn, force_refresh=True), chat_id=chat_id)
         elif cmd == "/audit":
@@ -1425,36 +1479,39 @@ def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -
             if os.path.exists(CHART_PATH):
                 send_telegram_photo(CHART_PATH, f"APEX-QUANT-OMNI {BOT_VERSION} Backtest Equity", chat_id=chat_id)
             else:
-                send_telegram_message("Chart not generated yet; run /check first.", chat_id=chat_id)
+                send_telegram_message("Chart belum tersedia; jalankan /check terlebih dahulu.", chat_id=chat_id)
         elif cmd == "/status":
             now_utc = datetime.now(timezone.utc)
             bbo = fetch_swissquote_bbo()
             spr_val = bbo["spread"] if bbo else 0.0
-            s_ok, s_reason, s_name, req_sc = evaluate_session_governor(now_utc, spr_val)
+            _, _, s_name, req_sc = evaluate_session_governor(now_utc, spr_val)
             events, src = fetch_realtime_usd_high_impact_calendar(conn, force_refresh=False)
             ng = evaluate_news_governor(events, now_utc, src)
+            bbo_line = (
+                f"<b>Spot:</b> <code>{bbo['bid']:.2f}/{bbo['ask']:.2f}</code> (Spr <code>${spr_val:.2f}</code>)"
+                if bbo else "<b>Spot:</b> <i>Unavailable</i>"
+            )
             status_msg = (
-                f"🛰 <b>APEX-QUANT-OMNI {BOT_VERSION} STATUS</b>\n"
-                f"<b>Time:</b> <code>{_esc(format_utc_wib(now_utc))}</code>\n"
-                f"<b>Session:</b> <code>{_esc(s_name)}</code> ({_esc(s_reason)}) | Req Score: <code>{req_sc}</code>\n"
-                f"<b>NewsGov:</b> <code>{_esc(ng['status_code'])}</code>\n"
-                f"<b>Live BBO:</b> Bid <code>{bbo['bid']:.2f}</code> Ask <code>{bbo['ask']:.2f}</code> Spread <code>${spr_val:.2f}</code>"
-                if bbo else
-                f"🛰 <b>APEX-QUANT-OMNI {BOT_VERSION} STATUS</b>\n<b>Session:</b> <code>{_esc(s_name)}</code>\n<b>NewsGov:</b> <code>{_esc(ng['status_code'])}</code>"
+                f"🛰 <b>STATUS XAUUSD ({BOT_VERSION})</b>\n"
+                f"<b>Waktu:</b> <code>{_esc(format_utc_wib(now_utc))}</code>\n"
+                f"<b>Sesi:</b> <code>{_esc(s_name)}</code> (Req&gt;={req_sc})\n"
+                f"<b>News:</b> <code>{_esc(ng['status_code'])}</code>\n"
+                f"{bbo_line}"
             )
             send_telegram_message(status_msg, chat_id=chat_id)
         elif cmd in ("/help", "/start"):
             help_msg = (
-                f"🤖 <b>APEX-QUANT-OMNI {BOT_VERSION} COMMANDS</b>\n"
-                "/check — Weighted 5-Pillar Spot XAUUSD analysis &amp; live news scrape\n"
-                "/news — Real-time High-Impact USD calendar &amp; Hard Blackout status\n"
-                "/status — Session, live BBO spread, &amp; governor check\n"
-                "/chart — Latest Grid Search equity curve PNG\n"
-                "/audit — Last 5 forensic signal audits"
+                f"🤖 <b>APEX-QUANT-OMNI {BOT_VERSION}</b>\n"
+                "/check — Analisa cepat XAUUSD + news\n"
+                "/news — Jadwal High-Impact USD\n"
+                "/status — Sesi &amp; spread live\n"
+                "/chart — Grafik backtest\n"
+                "/audit — 5 sinyal terakhir"
             )
             send_telegram_message(help_msg, chat_id=chat_id)
 
     set_state(conn, "tg_update_offset", str(max_uid))
+    return handled_check
 
 
 def run_continuous_polling_loop(conn: sqlite3.Connection) -> None:
@@ -1486,8 +1543,8 @@ def main() -> None:
         if args.mode == "polling":
             run_continuous_polling_loop(conn)
         else:
-            process_telegram_commands(conn, poll_timeout=0)
-            run_analysis_cycle(conn, notify_mode="auto")
+            handled_check = process_telegram_commands(conn, poll_timeout=0)
+            run_analysis_cycle(conn, notify_mode="auto", suppress_hold_notify=handled_check)
     except Exception as exc:
         logger.exception(f"Fatal execution error: {exc}")
         send_telegram_message(f"🚨 <b>FATAL ERROR ({BOT_VERSION}):</b> <code>{_esc(exc)}</code>")
