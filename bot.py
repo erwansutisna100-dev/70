@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-APEX-QUANT-OMNI SOVEREIGN (v75.6)
+APEX-QUANT-OMNI SOVEREIGN (v75.7)
 Institutional-Grade Spot Gold (XAUUSD) Quantitative Signal & Execution Engine
+Weighted 5-Pillar Harmonic SniperGate (Market Structure & Order Flow Priority)
 Real-Time Economic Calendar Scraper (ForexFactory + Investing.com) + Hard Blackout Governor
 """
 
@@ -37,7 +38,7 @@ logger = logging.getLogger("APEX-QUANT-OMNI")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-BOT_VERSION = "v75.6"
+BOT_VERSION = "v75.7"
 EPSILON = 1e-8
 DB_PATH = os.getenv("SQLITE_DB_PATH", "trading_signals.db")
 CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
@@ -58,8 +59,18 @@ NEWS_CACHE_TTL_MINUTES = int(os.getenv("NEWS_CACHE_TTL_MINUTES", "15"))
 
 MAX_EXTENSION_ATR = 1.80
 MIN_ORDERFLOW_CONFIRM = 0.12
+MIN_PRIORITY_PILLAR_NORM = 60.0
 WIB_TZ = timezone(timedelta(hours=7))
 NY_TZ = ZoneInfo("America/New_York")
+
+# Priority-weighted 5-pillar harmonic weights (sum = 1.00; SMC + Order Flow = 58%)
+PILLAR_WEIGHTS = {
+    "smc": 0.30,
+    "order_flow": 0.28,
+    "mtf": 0.18,
+    "zscore": 0.14,
+    "regime": 0.10,
+}
 
 CRITICAL_NEWS_KEYWORDS = (
     "non-farm", "nonfarm", "nfp", "fomc", "federal funds", "interest rate",
@@ -171,28 +182,21 @@ def forensic_audit_log(conn: sqlite3.Connection, record: dict) -> None:
 # REAL-TIME ECONOMIC CALENDAR SCRAPER & HARD BLACKOUT GOVERNOR
 # ==============================================================================
 def _parse_ff_time_to_utc(date_str: str, time_str: str, year_hint: int) -> datetime | None:
-    """Parse ForexFactory date & Eastern time (e.g. 'Wed Nov 18' + '8:30am') -> UTC."""
     t_clean = time_str.strip().lower()
     if not t_clean or any(tok in t_clean for tok in ("all day", "tentative", "day")):
         return None
     d_clean = re.sub(r"\s+", " ", date_str.strip())
-    # Strip leading weekday name if present: "Wed Nov 18" -> "Nov 18"
     d_parts = d_clean.split(" ")
     if len(d_parts) >= 3 and len(d_parts[0]) <= 4:
         d_clean = f"{d_parts[1]} {d_parts[2]}"
     try:
         dt_naive = datetime.strptime(f"{year_hint} {d_clean} {t_clean}", "%Y %b %d %I:%M%p")
-        dt_ny = dt_naive.replace(tzinfo=NY_TZ)
-        return dt_ny.astimezone(timezone.utc)
+        return dt_naive.replace(tzinfo=NY_TZ).astimezone(timezone.utc)
     except Exception:
         return None
 
 
 def scrape_forexfactory_html(now_utc: datetime) -> list[dict]:
-    """
-    Real-Time HTML Scraper for ForexFactory Economic Calendar (High-Impact USD).
-    Parses tr.calendar__row with BeautifulSoup4.
-    """
     url = "https://www.forexfactory.com/calendar?week=this"
     headers = {**BROWSER_HEADERS, "Referer": "https://www.forexfactory.com/"}
     resp = requests.get(url, headers=headers, timeout=12)
@@ -225,13 +229,10 @@ def scrape_forexfactory_html(now_utc: datetime) -> list[dict]:
         impact_span = row.select_one("td.calendar__impact span")
         impact_classes = " ".join(impact_span.get("class", [])) if impact_span else ""
         impact_title = (impact_span.get("title", "") if impact_span else "").lower()
-        is_high = ("impact-red" in impact_classes) or ("high" in impact_title)
-        if not is_high:
+        if ("impact-red" not in impact_classes) and ("high" not in impact_title):
             continue
 
-        title_cell = row.select_one("td.calendar__event span.calendar__event-title")
-        if not title_cell:
-            title_cell = row.select_one("td.calendar__event")
+        title_cell = row.select_one("td.calendar__event span.calendar__event-title") or row.select_one("td.calendar__event")
         title = title_cell.get_text(" ", strip=True) if title_cell else "USD High Impact"
 
         dt_utc = _parse_ff_time_to_utc(current_date_str, current_time_str, now_utc.year)
@@ -254,10 +255,6 @@ def scrape_forexfactory_html(now_utc: datetime) -> list[dict]:
 
 
 def scrape_investing_html(now_utc: datetime) -> list[dict]:
-    """
-    Real-Time HTML Scraper for Investing.com Economic Calendar (High-Impact USD).
-    Parses tr.js-event-item rows with data-event-datetime & 3-bull impact icons.
-    """
     url = "https://www.investing.com/economic-calendar/"
     headers = {**BROWSER_HEADERS, "Referer": "https://www.investing.com/"}
     resp = requests.get(url, headers=headers, timeout=12)
@@ -277,7 +274,8 @@ def scrape_investing_html(now_utc: datetime) -> list[dict]:
             continue
 
         bulls = row.select("td.sentiment i.grayFullBullishIcon")
-        sentiment_title = (row.select_one("td.sentiment") or {}).get("title", "").lower() if row.select_one("td.sentiment") else ""
+        sent_td = row.select_one("td.sentiment")
+        sentiment_title = (sent_td.get("title", "") if sent_td else "").lower()
         if len(bulls) < 3 and "high" not in sentiment_title:
             continue
 
@@ -285,9 +283,7 @@ def scrape_investing_html(now_utc: datetime) -> list[dict]:
         if not dt_raw:
             continue
         try:
-            dt_naive = datetime.strptime(dt_raw, "%Y/%m/%d %H:%M:%S")
-            # Investing.com default unauthenticated server clock is typically GMT/UTC or NY
-            dt_utc = dt_naive.replace(tzinfo=timezone.utc)
+            dt_utc = datetime.strptime(dt_raw, "%Y/%m/%d %H:%M:%S").replace(tzinfo=timezone.utc)
         except Exception:
             continue
 
@@ -310,13 +306,11 @@ def scrape_investing_html(now_utc: datetime) -> list[dict]:
 
 
 def fetch_forexfactory_json_feed() -> list[dict]:
-    """Structured Real-Time Failover: ForexFactory Weekly JSON Feed."""
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     resp = requests.get(url, headers={"User-Agent": BROWSER_HEADERS["User-Agent"]}, timeout=12)
     resp.raise_for_status()
-    data = resp.json()
     events = []
-    for item in data:
+    for item in resp.json():
         if str(item.get("country", "")).upper() != "USD":
             continue
         if str(item.get("impact", "")).lower() != "high":
@@ -344,15 +338,13 @@ def fetch_forexfactory_json_feed() -> list[dict]:
 
 
 def generate_deterministic_nfp_guard(now_utc: datetime) -> list[dict]:
-    """Deterministic First-Friday NFP (08:30 AM New York time -> UTC) safety net."""
     events = []
     for month_offset in (0, 1):
         year = now_utc.year + (now_utc.month + month_offset - 1) // 12
         month = (now_utc.month + month_offset - 1) % 12 + 1
         first_day = datetime(year, month, 1, 8, 30, tzinfo=NY_TZ)
         days_until_friday = (4 - first_day.weekday()) % 7
-        nfp_ny = first_day + timedelta(days=days_until_friday)
-        nfp_utc = nfp_ny.astimezone(timezone.utc)
+        nfp_utc = (first_day + timedelta(days=days_until_friday)).astimezone(timezone.utc)
         events.append({
             "title": "Non-Farm Employment Change (NFP Deterministic Guard)",
             "country": "USD",
@@ -382,13 +374,6 @@ def _deduplicate_events(events: list[dict]) -> list[dict]:
 def fetch_realtime_usd_high_impact_calendar(
     conn: sqlite3.Connection, force_refresh: bool = False
 ) -> tuple[list[dict], str]:
-    """
-    Multi-source real-time USD High-Impact Economic Calendar ingestion:
-    1. ForexFactory Real-Time HTML Scrape (BeautifulSoup)
-    2. Investing.com Real-Time HTML Scrape (BeautifulSoup)
-    3. ForexFactory Official Weekly JSON Feed (anti-Cloudflare failover)
-    4. Deterministic First-Friday NFP Guard (always merged)
-    """
     now_utc = datetime.now(timezone.utc)
 
     if not force_refresh:
@@ -400,8 +385,7 @@ def fetch_realtime_usd_high_impact_calendar(
                 fetched_at = datetime.fromisoformat(row[0])
                 age_min = (now_utc - fetched_at).total_seconds() / 60.0
                 if age_min <= NEWS_CACHE_TTL_MINUTES:
-                    cached = json.loads(row[2])
-                    return cached, f"{row[1]} (Cached {age_min:.0f}m)"
+                    return json.loads(row[2]), f"{row[1]} (Cached {age_min:.0f}m)"
             except Exception:
                 pass
 
@@ -461,10 +445,6 @@ def fetch_realtime_usd_high_impact_calendar(
 def evaluate_news_governor(
     events: list[dict], now_utc: datetime, source_label: str
 ) -> dict:
-    """
-    Evaluates Hard Blackout window [-BEFORE_MIN, +AFTER_MIN] around any USD High-Impact event.
-    Suspends BUY/SELL signal generation to eliminate NFP/FOMC/CPI slippage.
-    """
     active_blackouts = []
     upcoming = []
 
@@ -475,18 +455,14 @@ def evaluate_news_governor(
             continue
 
         delta_min = (ev_dt - now_utc).total_seconds() / 60.0
-        title_lower = ev["title"].lower()
-        is_tier1 = any(kw in title_lower for kw in CRITICAL_NEWS_KEYWORDS)
-        before_win = NEWS_BLACKOUT_BEFORE_MIN
-        after_win = NEWS_BLACKOUT_AFTER_MIN
+        is_tier1 = any(kw in ev["title"].lower() for kw in CRITICAL_NEWS_KEYWORDS)
 
-        if -after_win <= delta_min <= before_win:
-            resume_dt = ev_dt + timedelta(minutes=after_win)
+        if -NEWS_BLACKOUT_AFTER_MIN <= delta_min <= NEWS_BLACKOUT_BEFORE_MIN:
             active_blackouts.append({
                 **ev,
                 "dt_utc": ev_dt,
                 "delta_min": delta_min,
-                "resume_utc": resume_dt,
+                "resume_utc": ev_dt + timedelta(minutes=NEWS_BLACKOUT_AFTER_MIN),
                 "is_tier1": is_tier1,
             })
         elif 0 < delta_min <= 72 * 60:
@@ -529,8 +505,7 @@ def fetch_swissquote_bbo() -> dict | None:
     try:
         resp = requests.get(url, timeout=6)
         resp.raise_for_status()
-        payload = resp.json()
-        for entry in payload:
+        for entry in resp.json():
             for p in entry.get("spreadProfilePrices", []):
                 bid = float(p.get("bid", 0.0))
                 ask = float(p.get("ask", 0.0))
@@ -553,18 +528,15 @@ def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [str(c[0]).strip() for c in df.columns]
     df = df.rename(columns={c: c.strip().capitalize() for c in df.columns})
-    req = ["Open", "High", "Low", "Close"]
-    if not all(col in df.columns for col in req):
+    if not all(col in df.columns for col in ("Open", "High", "Low", "Close")):
         return pd.DataFrame()
     if "Volume" not in df.columns:
         df = df.assign(Volume=1.0)
     df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-    df = df.sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-    return df
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
+    return df[~df.index.duplicated(keep="last")]
 
 
 def _fetch_yfinance_spot(interval: str, period: str) -> pd.DataFrame:
@@ -585,8 +557,7 @@ def _fetch_yahoo_v8_http(interval: str, range_str: str) -> pd.DataFrame:
             return pd.DataFrame()
         if resp.status_code != 200:
             return pd.DataFrame()
-        data = resp.json()
-        result = data.get("chart", {}).get("result", [])
+        result = resp.json().get("chart", {}).get("result", [])
         if not result:
             return pd.DataFrame()
         ts = result[0].get("timestamp", [])
@@ -603,11 +574,13 @@ def _fetch_yahoo_v8_http(interval: str, range_str: str) -> pd.DataFrame:
 
 
 def _fetch_binance_paxg(interval: str, limit: int) -> pd.DataFrame:
-    url = "https://data-api.binance.vision/api/v3/klines"
-    resp = requests.get(url, params={"symbol": "PAXGUSDT", "interval": interval, "limit": limit}, timeout=10)
+    resp = requests.get(
+        "https://data-api.binance.vision/api/v3/klines",
+        params={"symbol": "PAXGUSDT", "interval": interval, "limit": limit},
+        timeout=10,
+    )
     resp.raise_for_status()
-    rows = resp.json()
-    df = pd.DataFrame(rows, columns=[
+    df = pd.DataFrame(resp.json(), columns=[
         "open_time", "Open", "High", "Low", "Close", "Volume",
         "close_time", "qav", "trades", "tbbav", "tbqav", "ignore"
     ])
@@ -616,15 +589,17 @@ def _fetch_binance_paxg(interval: str, limit: int) -> pd.DataFrame:
 
 
 def _fetch_kraken_paxg(interval_min: int) -> pd.DataFrame:
-    url = "https://api.kraken.com/0/public/OHLC"
-    resp = requests.get(url, params={"pair": "PAXGUSD", "interval": interval_min}, timeout=10)
+    resp = requests.get(
+        "https://api.kraken.com/0/public/OHLC",
+        params={"pair": "PAXGUSD", "interval": interval_min},
+        timeout=10,
+    )
     resp.raise_for_status()
     res = resp.json().get("result", {})
     pair_key = next((k for k in res.keys() if k != "last"), None)
     if not pair_key:
         return pd.DataFrame()
-    rows = res[pair_key]
-    df = pd.DataFrame(rows, columns=["ts", "Open", "High", "Low", "Close", "vwap", "Volume", "count"])
+    df = pd.DataFrame(res[pair_key], columns=["ts", "Open", "High", "Low", "Close", "vwap", "Volume", "count"])
     df.index = pd.to_datetime(df["ts"], unit="s", utc=True)
     return _clean_ohlcv(df)
 
@@ -649,7 +624,6 @@ def _calibrate_spot_proxy(df: pd.DataFrame, bbo: dict | None) -> pd.DataFrame:
 def ingest_spot_gold_data() -> tuple[pd.DataFrame, pd.DataFrame, dict | None, str]:
     bbo = fetch_swissquote_bbo()
 
-    # 1. Primary: yfinance Spot XAUUSD=X
     df15 = _fetch_yfinance_spot("15m", "15d")
     if len(df15) >= 200:
         df1h = _fetch_yfinance_spot("1h", "60d")
@@ -659,7 +633,6 @@ def ingest_spot_gold_data() -> tuple[pd.DataFrame, pd.DataFrame, dict | None, st
             return df15, df1h, bbo, src
     logger.info("Feed [Nominal (Primary: yfinance XAUUSD=X)] unavailable or rate-limited; advancing failover...")
 
-    # 2. Secondary: Yahoo v8 HTTP XAUUSD=X
     df15 = _fetch_yahoo_v8_http("15m", "15d")
     if len(df15) >= 200:
         df1h = _fetch_yahoo_v8_http("1h", "60d")
@@ -669,7 +642,6 @@ def ingest_spot_gold_data() -> tuple[pd.DataFrame, pd.DataFrame, dict | None, st
             return df15, df1h, bbo, src
     logger.info("Feed [Failover Active (Secondary: Yahoo v8 HTTP XAUUSD=X)] unavailable or rate-limited; advancing failover...")
 
-    # 3. Tertiary: Binance Vision PAXGUSDT + Swissquote Spot Calibration
     try:
         df15 = _calibrate_spot_proxy(_fetch_binance_paxg("15m", 1000), bbo)
         df1h = _calibrate_spot_proxy(_fetch_binance_paxg("1h", 750), bbo)
@@ -680,7 +652,6 @@ def ingest_spot_gold_data() -> tuple[pd.DataFrame, pd.DataFrame, dict | None, st
     except Exception as exc:
         logger.warning(f"Tertiary Binance Vision feed failed: {exc}")
 
-    # 4. Quaternary: Kraken PAXGUSD + Swissquote Spot Calibration
     try:
         df15 = _calibrate_spot_proxy(_fetch_kraken_paxg(15), bbo)
         df1h = _calibrate_spot_proxy(_fetch_kraken_paxg(60), bbo)
@@ -695,7 +666,7 @@ def ingest_spot_gold_data() -> tuple[pd.DataFrame, pd.DataFrame, dict | None, st
 
 
 # ==============================================================================
-# TECHNICAL INDICATORS & 5-PILLAR SNIPER ENGINE
+# TECHNICAL INDICATORS & WEIGHTED 5-PILLAR HARMONIC CONFLUENCE ENGINE
 # ==============================================================================
 def compute_indicators(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
     out = df.copy()
@@ -719,8 +690,6 @@ def compute_indicators(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
     minus_di = 100.0 * pd.Series(minus_dm, index=out.index).ewm(alpha=1.0 / 14.0, adjust=False).mean() / tr14
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di + EPSILON)
     out["ADX"] = dx.ewm(alpha=1.0 / 14.0, adjust=False).mean()
-    out["PLUS_DI"] = plus_di
-    out["MINUS_DI"] = minus_di
 
     # EMAs & Z-Score
     out["EMA20"] = close.ewm(span=20, adjust=False).mean()
@@ -729,21 +698,25 @@ def compute_indicators(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
     std20 = close.rolling(20).std().clip(lower=EPSILON)
     out["ZSCORE"] = (close - out["EMA20"]) / std20
 
-    # Volume Order Flow Proxy (CLV * Volume Balance)
+    # Volume Order Flow & 2-Bar Order Flow Momentum Acceleration
     bar_range = (high - low).clip(lower=EPSILON)
     clv = ((close - low) - (high - close)) / bar_range
     vol_safe = out["Volume"].replace(0, np.nan).ffill().fillna(1.0).clip(lower=EPSILON)
     vol_ma = vol_safe.rolling(20).mean().clip(lower=EPSILON)
     rel_vol = (vol_safe / vol_ma).clip(upper=3.0)
-    out["ORDER_FLOW"] = (clv * rel_vol).rolling(3).mean().clip(-1.0, 1.0)
+    out["ORDER_FLOW"] = (clv * rel_vol).rolling(3).mean().clip(-1.0, 1.0).fillna(0.0)
+    out["OF_MOMENTUM"] = (out["ORDER_FLOW"] - out["ORDER_FLOW"].shift(2)).fillna(0.0)
     return out
 
 
-def _evaluate_smc_pillar(df: pd.DataFrame, idx: int) -> tuple[int, str, str, float, float]:
-    """Pillar 1: SMC BOS / ChoCh / Liquidity Sweep / FVG + Swing Levels (0-25 pts)."""
+def _evaluate_smc_pillar(df: pd.DataFrame, idx: int) -> tuple[float, str, str, float, float]:
+    """
+    Pillar 1 (Normalized 0-100, Weight 30%):
+    SMC Liquidity Sweep, Break of Structure (BOS), Fair Value Gap (FVG), & Swing Structure.
+    """
     w = df.iloc[max(0, idx - 35): idx + 1]
     if len(w) < 15:
-        return 10, "NEUTRAL_RANGE", "NONE", float(df["Low"].iloc[idx]), float(df["High"].iloc[idx])
+        return 35.0, "NEUTRAL_RANGE", "NONE", float(df["Low"].iloc[idx]), float(df["High"].iloc[idx])
 
     c = float(w["Close"].iloc[-1])
     h_prev20 = float(w["High"].iloc[-21:-1].max())
@@ -751,22 +724,19 @@ def _evaluate_smc_pillar(df: pd.DataFrame, idx: int) -> tuple[int, str, str, flo
     recent_swing_low = float(w["Low"].iloc[-10:].min())
     recent_swing_high = float(w["High"].iloc[-10:].max())
 
-    # Fair Value Gap (3-candle imbalance)
     bull_fvg = float(w["Low"].iloc[-1]) > float(w["High"].iloc[-3])
     bear_fvg = float(w["High"].iloc[-1]) < float(w["Low"].iloc[-3])
-
-    # Liquidity Sweep (wick below swing low then close back inside/above)
     bull_sweep = float(w["Low"].iloc[-2]) < l_prev20 and float(w["Close"].iloc[-1]) > l_prev20
     bear_sweep = float(w["High"].iloc[-2]) > h_prev20 and float(w["Close"].iloc[-1]) < h_prev20
 
     if bull_sweep:
-        return 25, "BULLISH_LIQUIDITY_SWEEP", "BUY", recent_swing_low, recent_swing_high
+        return (100.0 if bull_fvg else 95.0), "BULLISH_LIQUIDITY_SWEEP", "BUY", recent_swing_low, recent_swing_high
     if bear_sweep:
-        return 25, "BEARISH_LIQUIDITY_SWEEP", "SELL", recent_swing_low, recent_swing_high
+        return (100.0 if bear_fvg else 95.0), "BEARISH_LIQUIDITY_SWEEP", "SELL", recent_swing_low, recent_swing_high
     if c > h_prev20:
-        return (24 if bull_fvg else 21), "BULLISH_BOS_UP", "BUY", recent_swing_low, recent_swing_high
+        return (95.0 if bull_fvg else 84.0), "BULLISH_BOS_UP", "BUY", recent_swing_low, recent_swing_high
     if c < l_prev20:
-        return (24 if bear_fvg else 21), "BEARISH_BOS_DOWN", "SELL", recent_swing_low, recent_swing_high
+        return (95.0 if bear_fvg else 84.0), "BEARISH_BOS_DOWN", "SELL", recent_swing_low, recent_swing_high
 
     hh = float(w["High"].iloc[-6:].max()) > float(w["High"].iloc[-14:-6].max())
     hl = float(w["Low"].iloc[-6:].min()) > float(w["Low"].iloc[-14:-6].min())
@@ -774,10 +744,10 @@ def _evaluate_smc_pillar(df: pd.DataFrame, idx: int) -> tuple[int, str, str, flo
     ll = float(w["Low"].iloc[-6:].min()) < float(w["Low"].iloc[-14:-6].min())
 
     if hh and hl:
-        return (19 if bull_fvg else 16), "BULLISH_HH_HL_STRUCTURE", "BUY", recent_swing_low, recent_swing_high
+        return (78.0 if bull_fvg else 66.0), "BULLISH_HH_HL_STRUCTURE", "BUY", recent_swing_low, recent_swing_high
     if lh and ll:
-        return (19 if bear_fvg else 16), "BEARISH_LH_LL_STRUCTURE", "SELL", recent_swing_low, recent_swing_high
-    return 9, "CONSOLIDATION_RANGE", "NONE", recent_swing_low, recent_swing_high
+        return (78.0 if bear_fvg else 66.0), "BEARISH_LH_LL_STRUCTURE", "SELL", recent_swing_low, recent_swing_high
+    return 35.0, "CONSOLIDATION_RANGE", "NONE", recent_swing_low, recent_swing_high
 
 
 def score_bar_confluence(
@@ -786,6 +756,14 @@ def score_bar_confluence(
     idx15: int,
     z_threshold: float,
 ) -> dict:
+    """
+    Weight-Based 5-Pillar Harmonic Confluence Scoring Engine (0-100):
+    - Pillar 1: SMC Market Structure (30%)
+    - Pillar 2: Order Flow Momentum & Absorption (28%)
+    - Pillar 3: Multi-Timeframe 1H/15M Harmony (18%)
+    - Pillar 4: Z-Score Pullback & Anti-Chasing (14%)
+    - Pillar 5: ADX Regime & Trigger Candle (10%)
+    """
     row = df15.iloc[idx15]
     ts = df15.index[idx15]
     h1_slice = df1h[df1h.index <= ts]
@@ -798,86 +776,109 @@ def score_bar_confluence(
     adx = float(row["ADX"])
     z = float(row["ZSCORE"])
     of = float(row["ORDER_FLOW"])
+    of_mom = float(row["OF_MOMENTUM"])
 
-    # MTF Bias (Pillar 4: 0-20 pts)
+    # Pillar 1: Market Structure (Normalized 0-100, Weight 30%)
+    smc_norm, smc_state, smc_dir, swing_low, swing_high = _evaluate_smc_pillar(df15, idx15)
+
+    # Pillar 3: Multi-Timeframe Bias & Harmony (Normalized 0-100, Weight 18%)
     h1_bull = float(h1_row["EMA20"]) > float(h1_row["EMA50"]) and float(h1_row["Close"]) > float(h1_row["EMA50"])
     h1_bear = float(h1_row["EMA20"]) < float(h1_row["EMA50"]) and float(h1_row["Close"]) < float(h1_row["EMA50"])
     m15_bull = ema20 > ema50
     m15_bear = ema20 < ema50
 
-    smc_pts, smc_state, smc_dir, swing_low, swing_high = _evaluate_smc_pillar(df15, idx15)
-
-    # Determine dominant candidate direction
     if h1_bull and m15_bull:
         bias = "BUY"
-        mtf_pts = 20 if adx >= 20 else 15
+        mtf_norm = 100.0 if adx >= 20.0 else 78.0
         mtf_state = "1H_15M_FULL_BULL_HARMONY"
     elif h1_bear and m15_bear:
         bias = "SELL"
-        mtf_pts = 20 if adx >= 20 else 15
+        mtf_norm = 100.0 if adx >= 20.0 else 78.0
         mtf_state = "1H_15M_FULL_BEAR_HARMONY"
     elif h1_bull and smc_dir == "BUY":
         bias = "BUY"
-        mtf_pts = 13
+        mtf_norm = 65.0
         mtf_state = "1H_BULL_PULLBACK_ALIGN"
     elif h1_bear and smc_dir == "SELL":
         bias = "SELL"
-        mtf_pts = 13
+        mtf_norm = 65.0
         mtf_state = "1H_BEAR_PULLBACK_ALIGN"
     else:
         bias = smc_dir if smc_dir in ("BUY", "SELL") else ("BUY" if z <= -z_threshold else "SELL")
-        mtf_pts = 6
+        mtf_norm = 25.0
         mtf_state = "MTF_DIVERGENCE"
 
-    # Pillar 2: Order Flow Confirmation (0-20 pts)
-    if bias == "BUY":
-        of_score = 20 if of >= 0.35 else (15 if of >= MIN_ORDERFLOW_CONFIRM else (8 if of > 0 else 2))
-        of_label = f"BULL_ABSORPTION ({of:+.2f})" if of >= MIN_ORDERFLOW_CONFIRM else f"BALANCED_ABSORPTION ({of:+.2f})"
-    else:
-        of_score = 20 if of <= -0.35 else (15 if of <= -MIN_ORDERFLOW_CONFIRM else (8 if of < 0 else 2))
-        of_label = f"BEAR_DISTRIBUTION ({of:+.2f})" if of <= -MIN_ORDERFLOW_CONFIRM else f"BALANCED_ABSORPTION ({of:+.2f})"
+    # Penalize SMC if Market Structure opposes dominant direction
+    if smc_dir != "NONE" and smc_dir != bias:
+        smc_norm = max(15.0, smc_norm - 55.0)
 
-    # Pillar 3: Z-Score Pullback & Anti-Chasing Extension (0-20 pts)
+    # Pillar 2: Order Flow Momentum & Delta Confirmation (Normalized 0-100, Weight 28%)
+    of_aligned = of if bias == "BUY" else -of
+    mom_accel = (of_mom >= 0.02) if bias == "BUY" else (of_mom <= -0.02)
+    if of_aligned >= 0.35:
+        of_norm = 100.0 if mom_accel else 88.0
+        of_label = f"{'BULL_SURGE' if bias == 'BUY' else 'BEAR_SURGE'} ({of:+.2f}, Δ{of_mom:+.2f})"
+    elif of_aligned >= MIN_ORDERFLOW_CONFIRM:
+        of_norm = 80.0 if mom_accel else 68.0
+        of_label = f"{'BULL_ABSORPTION' if bias == 'BUY' else 'BEAR_DISTRIBUTION'} ({of:+.2f}, Δ{of_mom:+.2f})"
+    elif of_aligned > 0.0:
+        of_norm = 35.0
+        of_label = f"BALANCED_ABSORPTION ({of:+.2f}, Δ{of_mom:+.2f})"
+    else:
+        of_norm = 10.0
+        of_label = f"COUNTER_ORDERFLOW ({of:+.2f}, Δ{of_mom:+.2f})"
+
+    # Pillar 4: Z-Score Pullback & Anti-Chasing Extension (Normalized 0-100, Weight 14%)
     ext_atr = (close - ema20) / atr
     if bias == "BUY":
         if -1.0 <= z <= 0.8 and abs(ext_atr) <= MAX_EXTENSION_ATR:
-            z_pts = 20
+            z_norm = 100.0
         elif -z_threshold <= z < -1.0:
-            z_pts = 14
+            z_norm = 72.0
         elif ext_atr > MAX_EXTENSION_ATR:
-            z_pts = 3
+            z_norm = 10.0
         else:
-            z_pts = 9
+            z_norm = 45.0
     else:
         if -0.8 <= z <= 1.0 and abs(ext_atr) <= MAX_EXTENSION_ATR:
-            z_pts = 20
+            z_norm = 100.0
         elif 1.0 < z <= z_threshold:
-            z_pts = 14
+            z_norm = 72.0
         elif ext_atr < -MAX_EXTENSION_ATR:
-            z_pts = 3
+            z_norm = 10.0
         else:
-            z_pts = 9
+            z_norm = 45.0
 
-    # Pillar 5: ADX Regime & Trigger Candle Precision (0-15 pts)
+    # Pillar 5: ADX Regime & Trigger Candle Precision (Normalized 0-100, Weight 10%)
     candle_bull = float(row["Close"]) > float(row["Open"])
     candle_bear = float(row["Close"]) < float(row["Open"])
     trigger_ok = (bias == "BUY" and candle_bull) or (bias == "SELL" and candle_bear)
-    if adx >= 25 and trigger_ok:
-        regime_pts = 15
-    elif adx >= 18 and trigger_ok:
-        regime_pts = 12
-    elif adx >= 18:
-        regime_pts = 8
+    if adx >= 25.0 and trigger_ok:
+        regime_norm = 100.0
+    elif adx >= 18.0 and trigger_ok:
+        regime_norm = 80.0
+    elif adx >= 18.0:
+        regime_norm = 50.0
     else:
-        regime_pts = 4
+        regime_norm = 20.0
 
-    # Penalty if SMC opposes dominant bias
-    if smc_dir != "NONE" and smc_dir != bias:
-        smc_pts = max(4, smc_pts - 10)
+    weighted_score = (
+        smc_norm * PILLAR_WEIGHTS["smc"]
+        + of_norm * PILLAR_WEIGHTS["order_flow"]
+        + mtf_norm * PILLAR_WEIGHTS["mtf"]
+        + z_norm * PILLAR_WEIGHTS["zscore"]
+        + regime_norm * PILLAR_WEIGHTS["regime"]
+    )
+    total_score = int(round(min(100.0, max(0.0, weighted_score))))
 
-    total_score = int(min(100, smc_pts + mtf_pts + of_score + z_pts + regime_pts))
     anti_chase_ok = (ext_atr <= MAX_EXTENSION_ATR) if bias == "BUY" else (ext_atr >= -MAX_EXTENSION_ATR)
-    of_ok = (of >= MIN_ORDERFLOW_CONFIRM) if bias == "BUY" else (of <= -MIN_ORDERFLOW_CONFIRM)
+    of_ok = of_aligned >= MIN_ORDERFLOW_CONFIRM
+    priority_pillars_ok = (smc_norm >= MIN_PRIORITY_PILLAR_NORM) and (of_norm >= MIN_PRIORITY_PILLAR_NORM)
+
+    weighted_breakdown = (
+        f"SMC={smc_norm:.0f}(w30) OF={of_norm:.0f}(w28) MTF={mtf_norm:.0f}(w18) "
+        f"Z={z_norm:.0f}(w14) Reg={regime_norm:.0f}(w10)"
+    )
 
     return {
         "bias": bias,
@@ -886,6 +887,7 @@ def score_bar_confluence(
         "mtf_state": mtf_state,
         "of_label": of_label,
         "order_flow": of,
+        "of_momentum": of_mom,
         "z_score": z,
         "adx": adx,
         "atr": atr,
@@ -894,6 +896,13 @@ def score_bar_confluence(
         "trigger_ok": trigger_ok,
         "anti_chase_ok": anti_chase_ok,
         "of_ok": of_ok,
+        "smc_norm": smc_norm,
+        "of_norm": of_norm,
+        "mtf_norm": mtf_norm,
+        "z_norm": z_norm,
+        "regime_norm": regime_norm,
+        "priority_pillars_ok": priority_pillars_ok,
+        "weighted_breakdown": weighted_breakdown,
         "ext_atr": ext_atr,
     }
 
@@ -915,6 +924,7 @@ def run_synchronized_backtest(
         sig = score_bar_confluence(df15, df1h, i, z_threshold)
         if (
             sig["score"] >= BASE_CONFLUENCE_THRESHOLD
+            and sig["priority_pillars_ok"]
             and sig["adx"] >= 18.0
             and sig["anti_chase_ok"]
             and sig["of_ok"]
@@ -942,7 +952,7 @@ def run_synchronized_backtest(
                         break
                     if not tp1_hit and hi >= tp1:
                         tp1_hit = True
-                        cur_sl = entry  # Auto-Trailing Breakeven at TP1
+                        cur_sl = entry
                     if hi >= tp2:
                         trade_r = 0.5 * 1.5 + 0.5 * 2.5
                         exit_idx = j
@@ -1044,16 +1054,12 @@ def evaluate_session_governor(now_utc: datetime, spread_usd: float) -> tuple[boo
     wd = now_utc.weekday()
     hh = now_utc.hour
 
-    # Weekend market close (Fri 22:00 UTC -> Sun 22:00 UTC)
     if (wd == 4 and hh >= 22) or wd == 5 or (wd == 6 and hh < 22):
         return False, "WEEKEND_MARKET_CLOSED", "WEEKEND_CLOSED", 99
-    # Daily rollover blackout 21:00 - 22:00 UTC
     if hh == 21:
         return False, "DAILY_ROLLOVER_BLACKOUT (21:00-22:00 UTC)", "ROLLOVER_BLACKOUT", 99
-    # Asian low liquidity open 22:00 - 23:00 UTC
     if hh == 22:
         return False, "ASIAN_OPEN_ILLIQUIDITY (22:00-23:00 UTC)", "ASIAN_OPEN_HOLD", 99
-    # Live Spread Guard
     if spread_usd > MAX_ALLOWED_SPREAD_USD:
         return False, f"SPREAD_GUARD_TRIGGERED (${spread_usd:.2f} > ${MAX_ALLOWED_SPREAD_USD:.2f})", "HIGH_SPREAD", 99
 
@@ -1178,7 +1184,7 @@ def run_analysis_cycle(
     risk_usd = round(ACCOUNT_BALANCE * (RISK_PERCENT / 100.0), 2)
     lot_size = round(max(0.01, min(5.0, risk_usd / max(sl_dist * 100.0, EPSILON))), 2)
 
-    # 5. Dual Governors: Hard News Blackout -> Session/Spread -> Sniper Precision Gates
+    # 5. Dual Governors + Priority-Weighted SniperGate
     session_ok, session_reason, session_name, req_score = evaluate_session_governor(now_utc, spread_usd)
 
     if news_gov["hard_blackout"]:
@@ -1189,9 +1195,17 @@ def run_analysis_cycle(
         decision = "SESSION HOLD"
         sniper_note = session_reason
         lot_out, risk_out = 0.0, 0.0
+    elif sig["smc_norm"] < MIN_PRIORITY_PILLAR_NORM:
+        decision = "NEUTRAL / HOLD"
+        sniper_note = f"Priority SMC Structure weak ({sig['smc_norm']:.0f} below {MIN_PRIORITY_PILLAR_NORM:.0f})"
+        lot_out, risk_out = lot_size, risk_usd
+    elif sig["of_norm"] < MIN_PRIORITY_PILLAR_NORM or not sig["of_ok"]:
+        decision = "NEUTRAL / HOLD"
+        sniper_note = f"Priority OrderFlow unconfirmed ({sig['order_flow']:+.2f}, norm={sig['of_norm']:.0f})"
+        lot_out, risk_out = lot_size, risk_usd
     elif sig["score"] < req_score:
         decision = "NEUTRAL / HOLD"
-        sniper_note = f"Confluence {sig['score']} below Req {req_score}"
+        sniper_note = f"Weighted Confluence {sig['score']} below Req {req_score}"
         lot_out, risk_out = lot_size, risk_usd
     elif sig["adx"] < 18.0:
         decision = "NEUTRAL / HOLD"
@@ -1201,17 +1215,13 @@ def run_analysis_cycle(
         decision = "NEUTRAL / HOLD"
         sniper_note = f"Extended Price ({sig['ext_atr']:+.2f} ATR)"
         lot_out, risk_out = lot_size, risk_usd
-    elif not sig["of_ok"]:
-        decision = "NEUTRAL / HOLD"
-        sniper_note = f"OrderFlow unconfirmed ({sig['order_flow']:+.2f})"
-        lot_out, risk_out = lot_size, risk_usd
     elif not sig["trigger_ok"]:
         decision = "NEUTRAL / HOLD"
         sniper_note = "Awaiting Trigger Candle close"
         lot_out, risk_out = lot_size, risk_usd
     else:
         decision = f"VERIFIED {bias}"
-        sniper_note = "ALL_SNIPER_GATES_PASSED"
+        sniper_note = "ALL_WEIGHTED_SNIPER_GATES_PASSED"
         lot_out, risk_out = lot_size, risk_usd
 
     # 6. Build Telegram HTML Report
@@ -1225,7 +1235,8 @@ def run_analysis_cycle(
 
     msg_html = (
         f"{icon} <b>APEX-QUANT-OMNI {BOT_VERSION} — XAUUSD SPOT</b>\n"
-        f"<b>Decision:</b> <code>{_esc(decision)}</code> | <b>Score:</b> <code>{sig['score']}/100</code> (Req&gt;={req_score})\n"
+        f"<b>Decision:</b> <code>{_esc(decision)}</code> | <b>Weighted Score:</b> <code>{sig['score']}/100</code> (Req&gt;={req_score})\n"
+        f"<b>Pillars:</b> <code>{_esc(sig['weighted_breakdown'])}</code>\n"
         f"<b>Spot BBO:</b> Bid <code>{bid:.2f}</code> | Ask <code>{ask:.2f}</code> | Spread <code>${spread_usd:.2f}</code>\n"
         f"<b>Plan ({_esc(bias)}):</b> Entry <code>{entry:.2f}</code> | SL <code>{sl:.2f}</code>\n"
         f"<b>Targets:</b> TP1 <code>{tp1:.2f}</code> | TP2 <code>{tp2:.2f}</code> | TP3 <code>{tp3:.2f}</code>\n"
@@ -1258,7 +1269,8 @@ def run_analysis_cycle(
             send_discord_alert(msg_html)
             webhook_status = "Delivered via Exponential Backoff" if ok_tg else "Telegram Delivery Failed"
     else:
-        logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery." if not DISCORD_WEBHOOK_URL else "Standby.")
+        if not DISCORD_WEBHOOK_URL:
+            logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery.")
 
     if notify_mode != "command" and not DISCORD_WEBHOOK_URL and should_send:
         logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery.")
@@ -1286,6 +1298,7 @@ def run_analysis_cycle(
 
     logger.info("========== FORENSIC AUDIT LOG ==========")
     logger.info(f"Asset=XAUUSD (SPOT GOLD) | Decision={decision} | Score={sig['score']}/100 (Req>={req_score}) | Source={data_src}")
+    logger.info(f"WeightedPillars: {sig['weighted_breakdown']}")
     logger.info(f"Entry={entry:.2f} | SL={sl:.2f} | TP1={tp1:.2f} | TP2={tp2:.2f} | TP3={tp3:.2f} | Bid={bid:.2f} Ask={ask:.2f} Spread=${spread_usd:.2f}")
     logger.info(f"Z-Score={sig['z_score']:.4f} | ADX={sig['adx']:.2f} | ATR={atr:.4f} | SMC={sig['smc_state']} | OrderFlow={sig['of_label']} | MTF={sig['mtf_state']}")
     logger.info(f"SniperGate={sniper_note} | NewsGovernor={news_gov['status_code']} | NewsSrc={news_gov['source']} | Session={session_name}")
@@ -1325,7 +1338,7 @@ def _build_news_reply(conn: sqlite3.Connection, force_refresh: bool = True) -> s
                 f"(+{hrs}h {mins}m) — <b>{_esc(ev['title'])}</b>"
             )
     else:
-        lines.append("✅ Tidak ada berita High-Impact USD dalam 72 jam ke depan.")
+        lines.append("✅ No USD High-Impact events scheduled in the next 72 hours.")
     return "\n".join(lines)
 
 
@@ -1335,8 +1348,8 @@ def _build_audit_reply(conn: sqlite3.Connection) -> str:
         "FROM signals_audit ORDER BY id DESC LIMIT 5"
     ).fetchall()
     if not rows:
-        return "📜 Belum ada riwayat audit tersimpan di SQLite."
-    lines = ["📜 <b>5 FORENSIC AUDIT TERAKHIR</b>"]
+        return "📜 No forensic audit records saved in SQLite yet."
+    lines = ["📜 <b>LAST 5 FORENSIC AUDITS</b>"]
     for ts, dec, sc, ent, spr, nstat in rows:
         lines.append(
             f"• <code>{_esc(ts[:16])}Z</code> | <b>{_esc(dec)}</b> ({sc}/100) "
@@ -1412,7 +1425,7 @@ def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -
             if os.path.exists(CHART_PATH):
                 send_telegram_photo(CHART_PATH, f"APEX-QUANT-OMNI {BOT_VERSION} Backtest Equity", chat_id=chat_id)
             else:
-                send_telegram_message("Chart belum tersedia; jalankan /check terlebih dahulu.", chat_id=chat_id)
+                send_telegram_message("Chart not generated yet; run /check first.", chat_id=chat_id)
         elif cmd == "/status":
             now_utc = datetime.now(timezone.utc)
             bbo = fetch_swissquote_bbo()
@@ -1433,11 +1446,11 @@ def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -
         elif cmd in ("/help", "/start"):
             help_msg = (
                 f"🤖 <b>APEX-QUANT-OMNI {BOT_VERSION} COMMANDS</b>\n"
-                "/check — Analisis Spot XAUUSD & kalender berita real-time\n"
-                "/news — Scrape real-time jadwal High-Impact USD & status Hard Blackout\n"
-                "/status — Cek sesi, spread BBO live, & governor\n"
-                "/chart — Kirim grafik ekuitas backtest terbaru\n"
-                "/audit — 5 riwayat sinyal forensik terakhir"
+                "/check — Weighted 5-Pillar Spot XAUUSD analysis &amp; live news scrape\n"
+                "/news — Real-time High-Impact USD calendar &amp; Hard Blackout status\n"
+                "/status — Session, live BBO spread, &amp; governor check\n"
+                "/chart — Latest Grid Search equity curve PNG\n"
+                "/audit — Last 5 forensic signal audits"
             )
             send_telegram_message(help_msg, chat_id=chat_id)
 
