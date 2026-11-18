@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-APEX-QUANT-OMNI SOVEREIGN (v76.0)
+APEX-QUANT-OMNI SOVEREIGN (v76.1)
 Institutional-Grade Spot Gold (XAUUSD) Quantitative Signal & Execution Engine
-- Closed-Candle (iloc[-2]) Sniper Evaluation + Live Entry Drift Guard
+- Exact UTC TwelveData Alignment + Effort-vs-Result FX OrderFlow Proxy
+- Closed-Candle (iloc[-2]) Pullback-Retest Sniper + Anti-Climax & HTF Guard
 - Weighted SniperGate: SMC 35% | Order Flow 30% | Z-Score 15% | ATR/Vol 10% | MTF 10%
-- Paginated ~1 Month (2500 Bars) Cost-Adjusted Synchronized Grid Search
-- Active Position Lifecycle Tracker (TP1 BE / TP2 / SL) + Anti-Duplicate Cooldown
+- 48-Bar Cost-Adjusted Synchronized Grid Search + Active Trade Lifecycle Tracker
 - Real-Time Economic Calendar Scraper + Hard Blackout + Clean Telegram Cards
 """
 
@@ -41,7 +41,7 @@ logger = logging.getLogger("APEX-QUANT-OMNI")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-BOT_VERSION = "v76.0"
+BOT_VERSION = "v76.1"
 EPSILON = 1e-8
 DB_PATH = os.getenv("SQLITE_DB_PATH", "trading_signals.db")
 CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
@@ -56,12 +56,13 @@ RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))
 BASE_CONFLUENCE_THRESHOLD = int(os.getenv("CONFLUENCE_THRESHOLD", "68"))
 MAX_ALLOWED_SPREAD_USD = float(os.getenv("MAX_ALLOWED_SPREAD_USD", "3.00"))
 FORCE_NOTIFY = os.getenv("FORCE_NOTIFY", "false").lower() in ("1", "true", "yes")
+REQUIRE_POSITIVE_BACKTEST = os.getenv("REQUIRE_POSITIVE_BACKTEST", "false").lower() in ("1", "true", "yes")
 
 NEWS_BLACKOUT_BEFORE_MIN = int(os.getenv("NEWS_BLACKOUT_BEFORE_MIN", "45"))
 NEWS_BLACKOUT_AFTER_MIN = int(os.getenv("NEWS_BLACKOUT_AFTER_MIN", "30"))
 NEWS_CACHE_TTL_MINUTES = int(os.getenv("NEWS_CACHE_TTL_MINUTES", "15"))
 
-MAX_EXTENSION_ATR = 1.80
+MAX_EXTENSION_ATR = 1.50
 MAX_ENTRY_DRIFT_ATR = 0.65
 MIN_ORDERFLOW_CONFIRM = 0.12
 MIN_PRIORITY_PILLAR_NORM = 60.0
@@ -71,10 +72,10 @@ NY_TZ = ZoneInfo("America/New_York")
 
 # SniperGate Confluence Weights (Exact Sum = 1.00 / 100%)
 PILLAR_WEIGHTS = {
-    "smc": 0.35,         # Market Structure (SMC BOS/Sweep/FVG): 35%
-    "order_flow": 0.30,  # Order Flow Momentum & Delta: 30%
+    "smc": 0.35,         # Market Structure (SMC BOS/Retest/Sweep/FVG): 35%
+    "order_flow": 0.30,  # Order Flow Momentum & Institutional Effort: 30%
     "zscore": 0.15,      # Z-Score Pullback & Anti-Chasing: 15%
-    "atr_vol": 0.10,     # ATR/Volatility Expansion & Trigger: 10%
+    "atr_vol": 0.10,     # ATR/Volatility Expansion & Trigger Body: 10%
     "mtf": 0.10,         # Multi-Timeframe 1H/15M Harmony: 10%
 }
 assert abs(sum(PILLAR_WEIGHTS.values()) - 1.0) < 1e-9, "PILLAR_WEIGHTS must sum to 1.00"
@@ -115,7 +116,7 @@ def _format_minutes_human(total_min: float) -> str:
 
 
 # ==============================================================================
-# SQLITE PERSISTENCE LAYER (AUDIT + ACTIVE TRADE LIFECYCLE)
+# SQLITE PERSISTENCE LAYER
 # ==============================================================================
 def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -532,7 +533,7 @@ def evaluate_news_governor(
 
 
 # ==============================================================================
-# SPOT GOLD MULTI-SOURCE INGESTION (PURE FX + PAGINATED 2500-BAR PROXY + BBO)
+# SPOT GOLD MULTI-SOURCE INGESTION (EXACT UTC TWELVEDATA + PAGINATED PROXY)
 # ==============================================================================
 def fetch_swissquote_bbo() -> dict | None:
     url = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
@@ -579,7 +580,13 @@ def _fetch_twelvedata_spot(interval: str, outputsize: int) -> pd.DataFrame:
     td_iv = "15min" if interval == "15m" else "1h"
     resp = requests.get(
         "https://api.twelvedata.com/time_series",
-        params={"symbol": "XAU/USD", "interval": td_iv, "outputsize": outputsize, "apikey": TWELVEDATA_API_KEY},
+        params={
+            "symbol": "XAU/USD",
+            "interval": td_iv,
+            "outputsize": outputsize,
+            "timezone": "UTC",
+            "apikey": TWELVEDATA_API_KEY,
+        },
         timeout=12,
     )
     resp.raise_for_status()
@@ -618,7 +625,6 @@ def _fetch_yahoo_v8_http(interval: str, range_str: str) -> pd.DataFrame:
 
 
 def _fetch_binance_paxg_paginated(interval: str, total_bars: int) -> pd.DataFrame:
-    """Fetches up to `total_bars` via Binance Vision API pagination (~1 month M15)."""
     all_rows = []
     end_ms = None
     remaining = total_bars
@@ -634,8 +640,7 @@ def _fetch_binance_paxg_paginated(interval: str, total_bars: int) -> pd.DataFram
         if not rows:
             break
         all_rows = rows + all_rows
-        earliest_open = int(rows[0][0])
-        end_ms = earliest_open - 1
+        end_ms = int(rows[0][0]) - 1
         remaining -= len(rows)
         if len(rows) < batch:
             break
@@ -687,19 +692,17 @@ def _calibrate_spot_proxy(df: pd.DataFrame, bbo: dict | None) -> pd.DataFrame:
 def ingest_spot_gold_data() -> tuple[pd.DataFrame, pd.DataFrame, dict | None, str]:
     bbo = fetch_swissquote_bbo()
 
-    # 0. Optional Pure Spot FX XAU/USD (if TWELVEDATA_API_KEY configured)
     if TWELVEDATA_API_KEY:
         try:
             df15 = _fetch_twelvedata_spot("15m", 2500)
             df1h = _fetch_twelvedata_spot("1h", 1000)
             if len(df15) >= 300 and len(df1h) >= 120:
-                src = "Nominal (Pure FX: TwelveData XAU/USD + Swissquote BBO)"
+                src = "Nominal (Pure FX: TwelveData XAU/USD UTC + Swissquote BBO)"
                 logger.info(f"Data ingestion succeeded via [{src}] | 15M bars={len(df15)} | 1H bars={len(df1h)}")
                 return df15, df1h, bbo, src
         except Exception as exc:
             logger.warning(f"TwelveData XAU/USD feed skipped: {exc}")
 
-    # 1. Primary: yfinance XAUUSD=X
     df15 = _fetch_yfinance_spot("15m", "30d")
     if len(df15) >= 300:
         df1h = _fetch_yfinance_spot("1h", "90d")
@@ -708,7 +711,6 @@ def ingest_spot_gold_data() -> tuple[pd.DataFrame, pd.DataFrame, dict | None, st
             logger.info(f"Data ingestion succeeded via [{src}] | 15M bars={len(df15)} | 1H bars={len(df1h)}")
             return df15, df1h, bbo, src
 
-    # 2. Secondary: Fail-Fast Yahoo v8 HTTP
     df15 = _fetch_yahoo_v8_http("15m", "30d")
     if len(df15) >= 300:
         df1h = _fetch_yahoo_v8_http("1h", "90d")
@@ -718,7 +720,6 @@ def ingest_spot_gold_data() -> tuple[pd.DataFrame, pd.DataFrame, dict | None, st
             return df15, df1h, bbo, src
     logger.info("Yahoo Spot feeds unavailable/rate-limited; advancing fast to paginated Spot Proxy...")
 
-    # 3. Tertiary: Paginated Binance Vision PAXGUSDT (2500 M15 / 1000 1H) + Swissquote BBO
     try:
         df15 = _calibrate_spot_proxy(_fetch_binance_paxg_paginated("15m", 2500), bbo)
         df1h = _calibrate_spot_proxy(_fetch_binance_paxg_paginated("1h", 1000), bbo)
@@ -729,7 +730,6 @@ def ingest_spot_gold_data() -> tuple[pd.DataFrame, pd.DataFrame, dict | None, st
     except Exception as exc:
         logger.warning(f"Tertiary Binance Vision feed failed: {exc}")
 
-    # 4. Quaternary: Kraken PAXGUSD + Swissquote BBO
     try:
         df15 = _calibrate_spot_proxy(_fetch_kraken_paxg(15), bbo)
         df1h = _calibrate_spot_proxy(_fetch_kraken_paxg(60), bbo)
@@ -744,11 +744,11 @@ def ingest_spot_gold_data() -> tuple[pd.DataFrame, pd.DataFrame, dict | None, st
 
 
 # ==============================================================================
-# TECHNICAL INDICATORS & WEIGHTED 5-PILLAR HARMONIC CONFLUENCE ENGINE
+# TECHNICAL INDICATORS & PULLBACK-RETEST WEIGHTED CONFLUENCE ENGINE
 # ==============================================================================
 def compute_indicators(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
     out = df.copy()
-    high, low, close = out["High"], out["Low"], out["Close"]
+    high, low, close, open_px = out["High"], out["Low"], out["Close"], out["Open"]
     prev_close = close.shift(1)
 
     tr = pd.concat([
@@ -778,24 +778,42 @@ def compute_indicators(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
     std20 = close.rolling(20).std().clip(lower=EPSILON)
     out["ZSCORE"] = (close - out["EMA20"]) / std20
 
-    # Volume Order Flow & 2-Bar Momentum Acceleration
+    # Institutional Order Flow: Real Volume when present, else Effort-vs-Result FX Proxy
     bar_range = (high - low).clip(lower=EPSILON)
     clv = ((close - low) - (high - close)) / bar_range
-    vol_safe = out["Volume"].replace(0, np.nan).ffill().fillna(1.0).clip(lower=EPSILON)
-    vol_ma = vol_safe.rolling(20).mean().clip(lower=EPSILON)
-    rel_vol = (vol_safe / vol_ma).clip(upper=3.0)
-    out["ORDER_FLOW"] = (clv * rel_vol).rolling(3).mean().clip(-1.0, 1.0).fillna(0.0)
+    body_ratio = (close - open_px).abs() / bar_range
+    out["BODY_RATIO"] = body_ratio.fillna(0.0)
+
+    vol_raw = out["Volume"].replace(0, np.nan).ffill().fillna(1.0).clip(lower=EPSILON)
+    has_real_vol = bool(vol_raw.std() > EPSILON and (vol_raw.max() > vol_raw.min()))
+
+    if has_real_vol:
+        vol_ma = vol_raw.rolling(20).mean().clip(lower=EPSILON)
+        rel_effort = (vol_raw / vol_ma).clip(upper=3.0)
+        out["VOL_MODE"] = "REAL_VOL"
+    else:
+        # Pure FX feed without volume: combine ATR-normalized range effort + body conviction
+        range_effort = (bar_range / out["ATR"]).clip(0.5, 2.2)
+        rel_effort = range_effort * (0.4 + 0.8 * body_ratio)
+        out["VOL_MODE"] = "FX_RANGE_PROXY"
+
+    out["ORDER_FLOW"] = (clv * rel_effort).rolling(2).mean().clip(-1.0, 1.0).fillna(0.0)
     out["OF_MOMENTUM"] = (out["ORDER_FLOW"] - out["ORDER_FLOW"].shift(2)).fillna(0.0)
     return out
 
 
 def _evaluate_smc_pillar(df: pd.DataFrame, idx: int) -> tuple[float, str, str, float, float]:
-    """Pillar 1 (Weight 35%): SMC Liquidity Sweep, BOS, FVG & Swing Structure."""
+    """
+    Pillar 1 (Weight 35%):
+    Rewards Liquidity Sweeps and BOS Pullback-Retests highest; avoids climax chase.
+    """
     w = df.iloc[max(0, idx - 35): idx + 1]
-    if len(w) < 15:
+    if len(w) < 22:
         return 35.0, "NEUTRAL_RANGE", "NONE", float(df["Low"].iloc[idx]), float(df["High"].iloc[idx])
 
     c = float(w["Close"].iloc[-1])
+    ema20 = float(w["EMA20"].iloc[-1])
+    atr = max(float(w["ATR"].iloc[-1]), EPSILON)
     h_prev20 = float(w["High"].iloc[-21:-1].max())
     l_prev20 = float(w["Low"].iloc[-21:-1].min())
     recent_swing_low = float(w["Low"].iloc[-10:].min())
@@ -803,17 +821,32 @@ def _evaluate_smc_pillar(df: pd.DataFrame, idx: int) -> tuple[float, str, str, f
 
     bull_fvg = float(w["Low"].iloc[-1]) > float(w["High"].iloc[-3])
     bear_fvg = float(w["High"].iloc[-1]) < float(w["Low"].iloc[-3])
-    bull_sweep = float(w["Low"].iloc[-2]) < l_prev20 and float(w["Close"].iloc[-1]) > l_prev20
-    bear_sweep = float(w["High"].iloc[-2]) > h_prev20 and float(w["Close"].iloc[-1]) < h_prev20
+    bull_sweep = float(w["Low"].iloc[-2]) < l_prev20 and c > l_prev20
+    bear_sweep = float(w["High"].iloc[-2]) > h_prev20 and c < h_prev20
 
     if bull_sweep:
         return (100.0 if bull_fvg else 95.0), "BULLISH_LIQUIDITY_SWEEP", "BUY", recent_swing_low, recent_swing_high
     if bear_sweep:
         return (100.0 if bear_fvg else 95.0), "BEARISH_LIQUIDITY_SWEEP", "SELL", recent_swing_low, recent_swing_high
+
+    # Check if BOS happened in prior 2..8 bars and price is now retesting near EMA20 value zone
+    prior_window_bull_bos = (w["Close"].iloc[-9:-1] > float(w["High"].iloc[-29:-9].max())).any() if len(w) >= 29 else False
+    prior_window_bear_bos = (w["Close"].iloc[-9:-1] < float(w["Low"].iloc[-29:-9].min())).any() if len(w) >= 29 else False
+    near_value_zone = abs(c - ema20) <= 0.9 * atr
+
+    if prior_window_bull_bos and near_value_zone and c > recent_swing_low:
+        return 96.0, "BULLISH_BOS_PULLBACK_RETEST", "BUY", recent_swing_low, recent_swing_high
+    if prior_window_bear_bos and near_value_zone and c < recent_swing_high:
+        return 96.0, "BEARISH_BOS_PULLBACK_RETEST", "SELL", recent_swing_low, recent_swing_high
+
     if c > h_prev20:
-        return (95.0 if bull_fvg else 84.0), "BULLISH_BOS_UP", "BUY", recent_swing_low, recent_swing_high
+        ext = (c - ema20) / atr
+        pts = 88.0 if (bull_fvg and ext <= 1.3) else (78.0 if ext <= 1.5 else 52.0)
+        return pts, "BULLISH_BOS_UP", "BUY", recent_swing_low, recent_swing_high
     if c < l_prev20:
-        return (95.0 if bear_fvg else 84.0), "BEARISH_BOS_DOWN", "SELL", recent_swing_low, recent_swing_high
+        ext = (ema20 - c) / atr
+        pts = 88.0 if (bear_fvg and ext <= 1.3) else (78.0 if ext <= 1.5 else 52.0)
+        return pts, "BEARISH_BOS_DOWN", "SELL", recent_swing_low, recent_swing_high
 
     hh = float(w["High"].iloc[-6:].max()) > float(w["High"].iloc[-14:-6].max())
     hl = float(w["Low"].iloc[-6:].min()) > float(w["Low"].iloc[-14:-6].min())
@@ -821,9 +854,9 @@ def _evaluate_smc_pillar(df: pd.DataFrame, idx: int) -> tuple[float, str, str, f
     ll = float(w["Low"].iloc[-6:].min()) < float(w["Low"].iloc[-14:-6].min())
 
     if hh and hl:
-        return (78.0 if bull_fvg else 66.0), "BULLISH_HH_HL_STRUCTURE", "BUY", recent_swing_low, recent_swing_high
+        return (80.0 if near_value_zone else 68.0), "BULLISH_HH_HL_STRUCTURE", "BUY", recent_swing_low, recent_swing_high
     if lh and ll:
-        return (78.0 if bear_fvg else 66.0), "BEARISH_LH_LL_STRUCTURE", "SELL", recent_swing_low, recent_swing_high
+        return (80.0 if near_value_zone else 68.0), "BEARISH_LH_LL_STRUCTURE", "SELL", recent_swing_low, recent_swing_high
     return 35.0, "CONSOLIDATION_RANGE", "NONE", recent_swing_low, recent_swing_high
 
 
@@ -846,11 +879,13 @@ def score_bar_confluence(df15: pd.DataFrame, df1h: pd.DataFrame, idx15: int, z_t
     z = float(row["ZSCORE"])
     of = float(row["ORDER_FLOW"])
     of_mom = float(row["OF_MOMENTUM"])
+    body_ratio = float(row["BODY_RATIO"])
+    vol_mode = str(row["VOL_MODE"])
 
     # 1. SMC Market Structure (35%)
     smc_norm, smc_state, smc_dir, swing_low, swing_high = _evaluate_smc_pillar(df15, idx15)
 
-    # 2. MTF Harmony 1H/15M (10%)
+    # 2. MTF Harmony 1H/15M (10%) + Strict HTF Directional Alignment
     h1_bull = float(h1_row["EMA20"]) > float(h1_row["EMA50"]) and float(h1_row["Close"]) > float(h1_row["EMA50"])
     h1_bear = float(h1_row["EMA20"]) < float(h1_row["EMA50"]) and float(h1_row["Close"]) < float(h1_row["EMA50"])
     m15_bull = ema20 > ema50
@@ -860,30 +895,35 @@ def score_bar_confluence(df15: pd.DataFrame, df1h: pd.DataFrame, idx15: int, z_t
         bias = "BUY"
         mtf_norm = 100.0 if adx >= 20.0 else 80.0
         mtf_state = "1H_15M_FULL_BULL_HARMONY"
+        htf_aligned = True
     elif h1_bear and m15_bear:
         bias = "SELL"
         mtf_norm = 100.0 if adx >= 20.0 else 80.0
         mtf_state = "1H_15M_FULL_BEAR_HARMONY"
+        htf_aligned = True
     elif h1_bull and smc_dir == "BUY":
         bias = "BUY"
-        mtf_norm = 65.0
+        mtf_norm = 70.0
         mtf_state = "1H_BULL_PULLBACK_ALIGN"
+        htf_aligned = True
     elif h1_bear and smc_dir == "SELL":
         bias = "SELL"
-        mtf_norm = 65.0
+        mtf_norm = 70.0
         mtf_state = "1H_BEAR_PULLBACK_ALIGN"
+        htf_aligned = True
     else:
         bias = smc_dir if smc_dir in ("BUY", "SELL") else ("BUY" if z <= -z_threshold else "SELL")
-        mtf_norm = 25.0
+        mtf_norm = 20.0
         mtf_state = "MTF_DIVERGENCE"
+        htf_aligned = False
 
     if smc_dir != "NONE" and smc_dir != bias:
         smc_norm = max(15.0, smc_norm - 55.0)
 
-    # 3. Order Flow Momentum & Delta (30%)
+    # 3. Order Flow Momentum & Institutional Effort (30%)
     of_aligned = of if bias == "BUY" else -of
     mom_accel = (of_mom >= 0.02) if bias == "BUY" else (of_mom <= -0.02)
-    if of_aligned >= 0.35:
+    if of_aligned >= 0.32:
         of_norm = 100.0 if mom_accel else 88.0
         of_label = f"{'BULL_SURGE' if bias == 'BUY' else 'BEAR_SURGE'} ({of:+.2f}, Δ{of_mom:+.2f})"
     elif of_aligned >= MIN_ORDERFLOW_CONFIRM:
@@ -896,39 +936,41 @@ def score_bar_confluence(df15: pd.DataFrame, df1h: pd.DataFrame, idx15: int, z_t
         of_norm = 10.0
         of_label = f"COUNTER_ORDERFLOW ({of:+.2f}, Δ{of_mom:+.2f})"
 
-    # 4. Z-Score Pullback & Anti-Chasing (15%)
+    # 4. Z-Score Pullback Sweet Spot & Anti-Climax Chasing (15%)
     ext_atr = (close - ema20) / atr
     if bias == "BUY":
-        if -1.0 <= z <= 0.6 and abs(ext_atr) <= MAX_EXTENSION_ATR:
+        if -1.3 <= z <= 0.35 and ext_atr <= MAX_EXTENSION_ATR:
             z_norm = 100.0
-        elif -z_threshold <= z < -1.0:
-            z_norm = 72.0
-        elif ext_atr > MAX_EXTENSION_ATR:
+        elif -z_threshold <= z < -1.3:
+            z_norm = 70.0
+        elif ext_atr > MAX_EXTENSION_ATR or z < -z_threshold:
             z_norm = 10.0
         else:
             z_norm = 45.0
+        anti_chase_ok = (ext_atr <= MAX_EXTENSION_ATR) and (abs(z) <= z_threshold)
     else:
-        if -0.6 <= z <= 1.0 and abs(ext_atr) <= MAX_EXTENSION_ATR:
+        if -0.35 <= z <= 1.3 and ext_atr >= -MAX_EXTENSION_ATR:
             z_norm = 100.0
-        elif 1.0 < z <= z_threshold:
-            z_norm = 72.0
-        elif ext_atr < -MAX_EXTENSION_ATR:
+        elif 1.3 < z <= z_threshold:
+            z_norm = 70.0
+        elif ext_atr < -MAX_EXTENSION_ATR or z > z_threshold:
             z_norm = 10.0
         else:
             z_norm = 45.0
+        anti_chase_ok = (ext_atr >= -MAX_EXTENSION_ATR) and (abs(z) <= z_threshold)
 
-    # 5. ATR/Volatility Expansion & Trigger Candle (10%)
+    # 5. ATR/Volatility Expansion & Trigger Candle Conviction (10%)
     candle_bull = float(row["Close"]) > float(row["Open"])
     candle_bear = float(row["Close"]) < float(row["Open"])
-    trigger_ok = (bias == "BUY" and candle_bull) or (bias == "SELL" and candle_bear)
-    if 0.80 <= atr_ratio <= 1.80 and adx >= 18.0 and trigger_ok:
+    trigger_ok = ((bias == "BUY" and candle_bull) or (bias == "SELL" and candle_bear)) and (body_ratio >= 0.30)
+    if 0.75 <= atr_ratio <= 1.85 and adx >= 20.0 and trigger_ok:
         atr_vol_norm = 100.0
     elif 0.65 <= atr_ratio <= 2.10 and trigger_ok:
         atr_vol_norm = 80.0
     elif 0.65 <= atr_ratio <= 2.10:
-        atr_vol_norm = 55.0
+        atr_vol_norm = 50.0
     else:
-        atr_vol_norm = 25.0
+        atr_vol_norm = 20.0
 
     weighted_score = (
         smc_norm * PILLAR_WEIGHTS["smc"]
@@ -939,7 +981,6 @@ def score_bar_confluence(df15: pd.DataFrame, df1h: pd.DataFrame, idx15: int, z_t
     )
     total_score = int(round(min(100.0, max(0.0, weighted_score))))
 
-    anti_chase_ok = (ext_atr <= MAX_EXTENSION_ATR) if bias == "BUY" else (ext_atr >= -MAX_EXTENSION_ATR)
     of_ok = of_aligned >= MIN_ORDERFLOW_CONFIRM
     priority_pillars_ok = (smc_norm >= MIN_PRIORITY_PILLAR_NORM) and (of_norm >= MIN_PRIORITY_PILLAR_NORM)
 
@@ -955,9 +996,11 @@ def score_bar_confluence(df15: pd.DataFrame, df1h: pd.DataFrame, idx15: int, z_t
         "bar_time_utc": ts.to_pydatetime(),
         "smc_state": smc_state,
         "mtf_state": mtf_state,
+        "htf_aligned": htf_aligned,
         "of_label": of_label,
         "order_flow": of,
         "of_momentum": of_mom,
+        "vol_mode": vol_mode,
         "z_score": z,
         "adx": adx,
         "atr": atr,
@@ -1000,7 +1043,7 @@ def evaluate_session_governor(now_utc: datetime, spread_usd: float) -> tuple[boo
 
 
 # ==============================================================================
-# COST-ADJUSTED SYNCHRONIZED GRID SEARCH BACKTESTER
+# 48-BAR COST-ADJUSTED SYNCHRONIZED GRID SEARCH BACKTESTER
 # ==============================================================================
 def run_synchronized_backtest(
     df15_raw: pd.DataFrame, df1h_raw: pd.DataFrame, atr_period: int, z_threshold: float, spread_usd: float
@@ -1011,7 +1054,7 @@ def run_synchronized_backtest(
     equity = [100.0]
 
     i = 210
-    n = len(df15) - 1  # Exclude live unclosed bar just like live execution
+    n = len(df15) - 1
     while i < n - 12:
         bar_dt = df15.index[i].to_pydatetime()
         sess_ok, _, _, req_sc = evaluate_session_governor(bar_dt, spread_usd)
@@ -1022,8 +1065,9 @@ def run_synchronized_backtest(
         sig = score_bar_confluence(df15, df1h, i, z_threshold)
         if (
             sig["score"] >= req_sc
+            and sig["htf_aligned"]
             and sig["priority_pillars_ok"]
-            and sig["adx"] >= 18.0
+            and sig["adx"] >= 20.0
             and sig["anti_chase_ok"]
             and sig["of_ok"]
             and sig["trigger_ok"]
@@ -1035,36 +1079,46 @@ def run_synchronized_backtest(
 
             sl = entry - risk_dist if sig["bias"] == "BUY" else entry + risk_dist
             tp1 = entry + 1.5 * risk_dist if sig["bias"] == "BUY" else entry - 1.5 * risk_dist
+            trail_trig = entry + 1.8 * risk_dist if sig["bias"] == "BUY" else entry - 1.8 * risk_dist
             tp2 = entry + 2.5 * risk_dist if sig["bias"] == "BUY" else entry - 2.5 * risk_dist
 
             tp1_hit = False
+            locked_half_r = False
             trade_r = 0.0
             cur_sl = sl
-            exit_idx = min(n - 1, i + 24)
+            exit_idx = min(n - 1, i + 48)
 
-            for j in range(i + 1, min(n, i + 25)):
+            for j in range(i + 1, min(n, i + 49)):
                 hi = float(df15["High"].iloc[j])
                 lo = float(df15["Low"].iloc[j])
                 if sig["bias"] == "BUY":
                     if lo <= cur_sl:
-                        trade_r = (0.5 * 1.5 if tp1_hit else -1.0) - cost_r
+                        rem_r = 0.5 if locked_half_r else 0.0
+                        trade_r = ((0.5 * 1.5 + 0.5 * rem_r) if tp1_hit else -1.0) - cost_r
                         exit_idx = j
                         break
                     if not tp1_hit and hi >= tp1:
                         tp1_hit = True
                         cur_sl = entry
+                    if tp1_hit and not locked_half_r and hi >= trail_trig:
+                        locked_half_r = True
+                        cur_sl = entry + 0.5 * risk_dist
                     if hi >= tp2:
                         trade_r = (0.5 * 1.5 + 0.5 * 2.5) - cost_r
                         exit_idx = j
                         break
                 else:
                     if hi >= cur_sl:
-                        trade_r = (0.5 * 1.5 if tp1_hit else -1.0) - cost_r
+                        rem_r = 0.5 if locked_half_r else 0.0
+                        trade_r = ((0.5 * 1.5 + 0.5 * rem_r) if tp1_hit else -1.0) - cost_r
                         exit_idx = j
                         break
                     if not tp1_hit and lo <= tp1:
                         tp1_hit = True
                         cur_sl = entry
+                    if tp1_hit and not locked_half_r and lo <= trail_trig:
+                        locked_half_r = True
+                        cur_sl = entry - 0.5 * risk_dist
                     if lo <= tp2:
                         trade_r = (0.5 * 1.5 + 0.5 * 2.5) - cost_r
                         exit_idx = j
@@ -1117,7 +1171,7 @@ def grid_search_optimize(df15_raw: pd.DataFrame, df1h_raw: pd.DataFrame, spread_
                 best_obj = obj
                 best = res
     logger.info(
-        f"Grid Search Optimal Selected (Cost-Adjusted): ATR={best['atr']}, Z={best['z']} | "
+        f"Grid Search Optimal Selected (48-Bar Cost-Adjusted): ATR={best['atr']}, Z={best['z']} | "
         f"Trades={best['trades']} | WR={best['wr']}% | PF={best['pf']:.2f} | "
         f"MDD={best['mdd']}% | Exp={best['exp']:+.2f}R"
     )
@@ -1153,11 +1207,6 @@ def save_backtest_chart(best_bt: dict, chart_path: str = CHART_PATH) -> None:
 def monitor_active_trades(
     conn: sqlite3.Connection, df15_raw: pd.DataFrame, bid: float, ask: float, now_utc: datetime
 ) -> dict | None:
-    """
-    Tracks any OPEN or TP1_BE signal chronologically bar-by-bar + live BBO.
-    Notifies Telegram on TP1 (BE move), TP2, TP3, or SL exit.
-    Returns remaining active trade dict if still open, else None.
-    """
     row = conn.execute(
         "SELECT id, opened_at_utc, side, entry_price, initial_sl, current_sl, tp1, tp2, tp3, lot_size, status, tp1_hit "
         "FROM active_trades WHERE status IN ('OPEN', 'TP1_BE') ORDER BY id DESC LIMIT 1"
@@ -1350,6 +1399,9 @@ def build_telegram_signal_card(
     else:
         news_short = "CLEAR"
 
+    bt_warn = " ⚠️Neg.BT" if (best_bt["trades"] >= 8 and best_bt["exp"] <= 0) else ""
+    bt_line = f"N={best_bt['trades']} WR <code>{best_bt['wr']}%</code> PF <code>{best_bt['pf']}</code> Exp <code>{best_bt['exp']:+.2f}R</code>{bt_warn}"
+
     if news_gov["hard_blackout"]:
         ev = news_gov["active_event"]
         resume_str = format_utc_wib(news_gov["resume_utc"]) if news_gov["resume_utc"] else "-"
@@ -1368,7 +1420,8 @@ def build_telegram_signal_card(
             f"<b>Entry:</b> <code>{entry:.2f}</code> | <b>SL:</b> <code>{sl:.2f}</code>\n"
             f"<b>TP1:</b> <code>{tp1:.2f}</code> | <b>TP2:</b> <code>{tp2:.2f}</code> | <b>TP3:</b> <code>{tp3:.2f}</code>\n"
             f"<b>Risk:</b> Lot <code>{lot_out:.2f}</code> (<code>${risk_out:.0f}</code>) | Trailing: <code>TP1 BE</code> | Spr <code>${spread_usd:.2f}</code>\n"
-            f"<b>News:</b> {_esc(news_short)} | <b>BT:</b> N={best_bt['trades']} WR <code>{best_bt['wr']}%</code> PF <code>{best_bt['pf']}</code>"
+            f"<b>News:</b> {_esc(news_short)}\n"
+            f"<b>BT:</b> {bt_line}"
         )
 
     pos_line = ""
@@ -1383,7 +1436,7 @@ def build_telegram_signal_card(
         f"<b>Spot:</b> <code>{bid:.2f} / {ask:.2f}</code> (Spr <code>${spread_usd:.2f}</code>)\n"
         f"<b>Bias ({_esc(bias)}):</b> {_esc(sniper_note)}\n"
         f"<b>Sesi:</b> <code>{_esc(session_name)}</code> | <b>News:</b> {_esc(news_short)}\n"
-        f"<b>BT (~1Bln):</b> N={best_bt['trades']} WR <code>{best_bt['wr']}%</code> PF <code>{best_bt['pf']}</code> Exp <code>{best_bt['exp']:+.2f}R</code>"
+        f"<b>BT (~1Bln):</b> {bt_line}"
         f"{pos_line}"
     )
 
@@ -1410,14 +1463,15 @@ def run_analysis_cycle(
     ask = bbo["ask"] if bbo else bid
     spread_usd = bbo["spread"] if bbo else 0.50
 
-    # 3. Active Position Lifecycle Check (TP1->BE / TP2 / SL)
+    # 3. Active Position Lifecycle Check
     active_trade = monitor_active_trades(conn, df15_raw, bid, ask, now_utc)
 
-    # 4. Extended Cost-Adjusted Synchronized Grid Search & Chart
+    # 4. Extended 48-Bar Cost-Adjusted Synchronized Grid Search & Chart
     best_bt = grid_search_optimize(df15_raw, df1h_raw, spread_usd)
     save_backtest_chart(best_bt, CHART_PATH)
+    neg_bt_edge = (best_bt["trades"] >= 8 and best_bt["exp"] <= 0.0)
 
-    # 5. Closed-Candle (iloc[-2]) Confluence Evaluation (Zero Repaint / Zero Volume Bias)
+    # 5. Closed-Candle (iloc[-2]) Confluence Evaluation
     df15 = compute_indicators(df15_raw, atr_period=best_bt["atr"])
     df1h = compute_indicators(df1h_raw, atr_period=best_bt["atr"])
     closed_idx = len(df15) - 2
@@ -1445,7 +1499,7 @@ def run_analysis_cycle(
     risk_usd = round(ACCOUNT_BALANCE * (RISK_PERCENT / 100.0), 2)
     lot_size = round(max(0.01, min(5.0, risk_usd / max(sl_dist * 100.0, EPSILON))), 2)
 
-    # 7. Dual Governors + Weighted SniperGate + Anti-Duplicate Position Cooldown
+    # 7. Dual Governors + Weighted SniperGate + HTF & Pullback Guards
     session_ok, session_reason, session_name, req_score = evaluate_session_governor(now_utc, spread_usd)
 
     if news_gov["hard_blackout"]:
@@ -1456,10 +1510,18 @@ def run_analysis_cycle(
         decision = "SESSION HOLD"
         sniper_note = session_reason
         lot_out, risk_out = 0.0, 0.0
+    elif REQUIRE_POSITIVE_BACKTEST and neg_bt_edge:
+        decision = "NEUTRAL / HOLD"
+        sniper_note = f"Backtest edge negatif (PF {best_bt['pf']:.2f}, Exp {best_bt['exp']:+.2f}R)"
+        lot_out, risk_out = 0.0, 0.0
     elif active_trade and active_trade["side"] == bias:
         decision = "POSITION ACTIVE / HOLD"
         sniper_note = f"Trade #{active_trade['id']} ({bias}) masih {active_trade['status']} (anti-double entry)"
         lot_out, risk_out = 0.0, 0.0
+    elif not sig["htf_aligned"]:
+        decision = "NEUTRAL / HOLD"
+        sniper_note = f"Kontra tren 1H ({sig['mtf_state']})"
+        lot_out, risk_out = lot_size, risk_usd
     elif drift_atr > MAX_ENTRY_DRIFT_ATR:
         decision = "NEUTRAL / HOLD"
         sniper_note = f"Entry drift terlalu jauh ({drift_atr:.2f} ATR dari close M15)"
@@ -1476,17 +1538,17 @@ def run_analysis_cycle(
         decision = "NEUTRAL / HOLD"
         sniper_note = f"Skor {sig['score']} belum mencapai Req {req_score}"
         lot_out, risk_out = lot_size, risk_usd
-    elif sig["adx"] < 18.0:
+    elif sig["adx"] < 20.0:
         decision = "NEUTRAL / HOLD"
-        sniper_note = f"ADX lemah ({sig['adx']:.1f} below 18.0)"
+        sniper_note = f"ADX lemah ({sig['adx']:.1f} below 20.0)"
         lot_out, risk_out = lot_size, risk_usd
     elif not sig["anti_chase_ok"]:
         decision = "NEUTRAL / HOLD"
-        sniper_note = f"Harga overextended ({sig['ext_atr']:+.2f} ATR)"
+        sniper_note = f"Harga klimaks/overextended (Z={sig['z_score']:+.2f}, Ext={sig['ext_atr']:+.2f} ATR)"
         lot_out, risk_out = lot_size, risk_usd
     elif not sig["trigger_ok"]:
         decision = "NEUTRAL / HOLD"
-        sniper_note = "Menunggu konfirmasi candle pemicu"
+        sniper_note = "Menunggu candle pemicu berkonviksi"
         lot_out, risk_out = lot_size, risk_usd
     else:
         decision = f"VERIFIED {bias}"
@@ -1527,7 +1589,8 @@ def run_analysis_cycle(
     if not DISCORD_WEBHOOK_URL:
         logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery.")
 
-    # 9. Full Forensic Audit Log (GitHub Actions Console + SQLite)
+    # 9. Full Forensic Audit Log
+    edge_tag = "NEGATIVE_EXPECTANCY_WARNING" if neg_bt_edge else "POSITIVE_EDGE"
     forensic_audit_log(conn, {
         "timestamp_utc": now_utc.isoformat(),
         "decision": decision,
@@ -1549,12 +1612,12 @@ def run_analysis_cycle(
     })
 
     logger.info("========== FORENSIC AUDIT LOG ==========")
-    logger.info(f"Asset=XAUUSD (SPOT GOLD) | Decision={decision} | Score={sig['score']}/100 (Req>={req_score}) | ClosedBar={sig['bar_time_utc'].strftime('%H:%M UTC')}")
-    logger.info(f"WeightedPillars: {sig['weighted_breakdown']} | Drift={drift_atr:.2f} ATR | Source={data_src}")
+    logger.info(f"Asset=XAUUSD (SPOT GOLD) | Decision={decision} | Score={sig['score']}/100 (Req>={req_score}) | ClosedBar={sig['bar_time_utc'].strftime('%Y-%m-%d %H:%M UTC')}")
+    logger.info(f"WeightedPillars: {sig['weighted_breakdown']} | VolMode={sig['vol_mode']} | Drift={drift_atr:.2f} ATR | Source={data_src}")
     logger.info(f"Entry={entry:.2f} | SL={sl:.2f} | TP1={tp1:.2f} | TP2={tp2:.2f} | TP3={tp3:.2f} | Bid={bid:.2f} Ask={ask:.2f} Spread=${spread_usd:.2f}")
     logger.info(f"Z-Score={sig['z_score']:.4f} | ADX={sig['adx']:.2f} | ATR={atr:.4f} (Ratio={sig['atr_ratio']:.2f}) | SMC={sig['smc_state']} | OrderFlow={sig['of_label']} | MTF={sig['mtf_state']}")
     logger.info(f"SniperGate={sniper_note} | NewsGovernor={news_gov['status_code']} | NewsSrc={news_gov['source']} | Session={session_name}")
-    logger.info(f"GridSearch(ATR={best_bt['atr']}, Z={best_bt['z']}, N={best_bt['trades']}) | WR={best_bt['wr']}% | PF={best_bt['pf']:.2f} | MDD={best_bt['mdd']}% | Exp={best_bt['exp']:+.2f}R")
+    logger.info(f"GridSearch(ATR={best_bt['atr']}, Z={best_bt['z']}, N={best_bt['trades']}) | WR={best_bt['wr']}% | PF={best_bt['pf']:.2f} | MDD={best_bt['mdd']}% | Exp={best_bt['exp']:+.2f}R | StrategyEdge={edge_tag}")
     logger.info(f"Lot={lot_out:.2f} | RiskUSD=${risk_out:.2f} | ActiveTrade={active_trade['id'] if active_trade else 'None'} | Webhook={webhook_status}")
     logger.info("========================================")
 
