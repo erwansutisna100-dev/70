@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-APEX-QUANT-OMNI SOVEREIGN (v75.9)
+APEX-QUANT-OMNI SOVEREIGN (v76.0)
 Institutional-Grade Spot Gold (XAUUSD) Quantitative Signal & Execution Engine
-Weighted SniperGate: SMC 35% | Order Flow 30% | Z-Score 15% | ATR/Vol 10% | MTF 10%
-Real-Time Economic Calendar Scraper + Hard Blackout + Clean Telegram Cards
+- Closed-Candle (iloc[-2]) Sniper Evaluation + Live Entry Drift Guard
+- Weighted SniperGate: SMC 35% | Order Flow 30% | Z-Score 15% | ATR/Vol 10% | MTF 10%
+- Paginated ~1 Month (2500 Bars) Cost-Adjusted Synchronized Grid Search
+- Active Position Lifecycle Tracker (TP1 BE / TP2 / SL) + Anti-Duplicate Cooldown
+- Real-Time Economic Calendar Scraper + Hard Blackout + Clean Telegram Cards
 """
 
 import os
@@ -38,7 +41,7 @@ logger = logging.getLogger("APEX-QUANT-OMNI")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-BOT_VERSION = "v75.9"
+BOT_VERSION = "v76.0"
 EPSILON = 1e-8
 DB_PATH = os.getenv("SQLITE_DB_PATH", "trading_signals.db")
 CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
@@ -46,6 +49,7 @@ CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "10000.0"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))
@@ -58,8 +62,10 @@ NEWS_BLACKOUT_AFTER_MIN = int(os.getenv("NEWS_BLACKOUT_AFTER_MIN", "30"))
 NEWS_CACHE_TTL_MINUTES = int(os.getenv("NEWS_CACHE_TTL_MINUTES", "15"))
 
 MAX_EXTENSION_ATR = 1.80
+MAX_ENTRY_DRIFT_ATR = 0.65
 MIN_ORDERFLOW_CONFIRM = 0.12
 MIN_PRIORITY_PILLAR_NORM = 60.0
+SIM_SLIPPAGE_USD = 0.15
 WIB_TZ = timezone(timedelta(hours=7))
 NY_TZ = ZoneInfo("America/New_York")
 
@@ -105,13 +111,11 @@ def format_utc_wib(dt_utc: datetime) -> str:
 
 def _format_minutes_human(total_min: float) -> str:
     m = max(0, int(round(total_min)))
-    if m >= 60:
-        return f"{m // 60}j {m % 60}m"
-    return f"{m}m"
+    return f"{m // 60}j {m % 60}m" if m >= 60 else f"{m}m"
 
 
 # ==============================================================================
-# SQLITE PERSISTENCE LAYER
+# SQLITE PERSISTENCE LAYER (AUDIT + ACTIVE TRADE LIFECYCLE)
 # ==============================================================================
 def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -135,6 +139,26 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             mtf_state TEXT,
             news_status TEXT,
             source TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS active_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            opened_at_utc TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            initial_sl REAL NOT NULL,
+            current_sl REAL NOT NULL,
+            tp1 REAL NOT NULL,
+            tp2 REAL NOT NULL,
+            tp3 REAL NOT NULL,
+            lot_size REAL NOT NULL,
+            score INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            tp1_hit INTEGER NOT NULL DEFAULT 0,
+            closed_at_utc TEXT,
+            exit_price REAL,
+            realized_r REAL DEFAULT 0.0
         )
     """)
     conn.execute("""
@@ -265,7 +289,7 @@ def scrape_forexfactory_html(now_utc: datetime) -> list[dict]:
 def scrape_investing_html(now_utc: datetime) -> list[dict]:
     url = "https://www.investing.com/economic-calendar/"
     headers = {**BROWSER_HEADERS, "Referer": "https://www.investing.com/"}
-    resp = requests.get(url, headers=headers, timeout=12)
+    resp = requests.get(url, headers=headers, timeout=10)
     if resp.status_code != 200 or "Just a moment" in resp.text:
         raise RuntimeError(f"Investing.com HTML blocked/unavailable (HTTP {resp.status_code})")
 
@@ -314,8 +338,11 @@ def scrape_investing_html(now_utc: datetime) -> list[dict]:
 
 
 def fetch_forexfactory_json_feed() -> list[dict]:
-    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-    resp = requests.get(url, headers={"User-Agent": BROWSER_HEADERS["User-Agent"]}, timeout=12)
+    resp = requests.get(
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
+        timeout=12,
+    )
     resp.raise_for_status()
     events = []
     for item in resp.json():
@@ -407,7 +434,7 @@ def fetch_realtime_usd_high_impact_calendar(
             source_parts.append(f"ForexFactory HTML ({len(ff_html)})")
             logger.info(f"Real-Time News Scrape succeeded [ForexFactory HTML]: {len(ff_html)} USD High-Impact event(s)")
     except Exception as exc:
-        logger.info(f"ForexFactory HTML scrape skipped/blocked ({exc}); checking Investing.com...")
+        logger.info(f"ForexFactory HTML scrape skipped/blocked ({exc}); checking failover...")
 
     if not scraped_events:
         try:
@@ -415,9 +442,8 @@ def fetch_realtime_usd_high_impact_calendar(
             if inv_html:
                 scraped_events.extend(inv_html)
                 source_parts.append(f"Investing.com HTML ({len(inv_html)})")
-                logger.info(f"Real-Time News Scrape succeeded [Investing.com HTML]: {len(inv_html)} USD High-Impact event(s)")
-        except Exception as exc:
-            logger.info(f"Investing.com HTML scrape skipped/blocked ({exc}); failing over to ForexFactory JSON...")
+        except Exception:
+            pass
 
     if not scraped_events:
         try:
@@ -506,7 +532,7 @@ def evaluate_news_governor(
 
 
 # ==============================================================================
-# SPOT GOLD MULTI-SOURCE DATA INGESTION & SWISSQUOTE LIVE BBO
+# SPOT GOLD MULTI-SOURCE INGESTION (PURE FX + PAGINATED 2500-BAR PROXY + BBO)
 # ==============================================================================
 def fetch_swissquote_bbo() -> dict | None:
     url = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
@@ -547,6 +573,25 @@ def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return df[~df.index.duplicated(keep="last")]
 
 
+def _fetch_twelvedata_spot(interval: str, outputsize: int) -> pd.DataFrame:
+    if not TWELVEDATA_API_KEY:
+        return pd.DataFrame()
+    td_iv = "15min" if interval == "15m" else "1h"
+    resp = requests.get(
+        "https://api.twelvedata.com/time_series",
+        params={"symbol": "XAU/USD", "interval": td_iv, "outputsize": outputsize, "apikey": TWELVEDATA_API_KEY},
+        timeout=12,
+    )
+    resp.raise_for_status()
+    values = resp.json().get("values", [])
+    if not values:
+        return pd.DataFrame()
+    df = pd.DataFrame(values)
+    df = df.rename(columns={"datetime": "ts", "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+    df.index = pd.to_datetime(df["ts"], utc=True)
+    return _clean_ohlcv(df)
+
+
 def _fetch_yfinance_spot(interval: str, period: str) -> pd.DataFrame:
     df = yf.download("XAUUSD=X", interval=interval, period=period, progress=False, threads=False)
     return _clean_ohlcv(df)
@@ -554,41 +599,51 @@ def _fetch_yfinance_spot(interval: str, period: str) -> pd.DataFrame:
 
 def _fetch_yahoo_v8_http(interval: str, range_str: str) -> pd.DataFrame:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval={interval}&range={range_str}"
-    for attempt in range(2):
-        resp = requests.get(url, headers={"User-Agent": BROWSER_HEADERS["User-Agent"]}, timeout=8)
-        if resp.status_code == 429:
-            if attempt == 0:
-                logger.warning(f"HTTP 429 on {url.split('?')[0]}. Retrying in 2s (attempt 1/1)...")
-                time.sleep(2)
-                continue
-            logger.warning(f"HTTP 429 on {url.split('?')[0]}: Too Many Requests")
-            return pd.DataFrame()
-        if resp.status_code != 200:
-            return pd.DataFrame()
-        result = resp.json().get("chart", {}).get("result", [])
-        if not result:
-            return pd.DataFrame()
-        ts = result[0].get("timestamp", [])
-        q = result[0].get("indicators", {}).get("quote", [{}])[0]
-        df = pd.DataFrame({
-            "Open": q.get("open", []),
-            "High": q.get("high", []),
-            "Low": q.get("low", []),
-            "Close": q.get("close", []),
-            "Volume": q.get("volume", [1.0] * len(ts)),
-        }, index=pd.to_datetime(ts, unit="s", utc=True))
-        return _clean_ohlcv(df)
-    return pd.DataFrame()
+    resp = requests.get(url, headers={"User-Agent": BROWSER_HEADERS["User-Agent"]}, timeout=6)
+    if resp.status_code != 200:
+        return pd.DataFrame()
+    result = resp.json().get("chart", {}).get("result", [])
+    if not result:
+        return pd.DataFrame()
+    ts = result[0].get("timestamp", [])
+    q = result[0].get("indicators", {}).get("quote", [{}])[0]
+    df = pd.DataFrame({
+        "Open": q.get("open", []),
+        "High": q.get("high", []),
+        "Low": q.get("low", []),
+        "Close": q.get("close", []),
+        "Volume": q.get("volume", [1.0] * len(ts)),
+    }, index=pd.to_datetime(ts, unit="s", utc=True))
+    return _clean_ohlcv(df)
 
 
-def _fetch_binance_paxg(interval: str, limit: int) -> pd.DataFrame:
-    resp = requests.get(
-        "https://data-api.binance.vision/api/v3/klines",
-        params={"symbol": "PAXGUSDT", "interval": interval, "limit": limit},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    df = pd.DataFrame(resp.json(), columns=[
+def _fetch_binance_paxg_paginated(interval: str, total_bars: int) -> pd.DataFrame:
+    """Fetches up to `total_bars` via Binance Vision API pagination (~1 month M15)."""
+    all_rows = []
+    end_ms = None
+    remaining = total_bars
+
+    while remaining > 0:
+        batch = min(1000, remaining)
+        params = {"symbol": "PAXGUSDT", "interval": interval, "limit": batch}
+        if end_ms is not None:
+            params["endTime"] = end_ms
+        resp = requests.get("https://data-api.binance.vision/api/v3/klines", params=params, timeout=10)
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows:
+            break
+        all_rows = rows + all_rows
+        earliest_open = int(rows[0][0])
+        end_ms = earliest_open - 1
+        remaining -= len(rows)
+        if len(rows) < batch:
+            break
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows, columns=[
         "open_time", "Open", "High", "Low", "Close", "Volume",
         "close_time", "qav", "trades", "tbbav", "tbqav", "ignore"
     ])
@@ -632,38 +687,53 @@ def _calibrate_spot_proxy(df: pd.DataFrame, bbo: dict | None) -> pd.DataFrame:
 def ingest_spot_gold_data() -> tuple[pd.DataFrame, pd.DataFrame, dict | None, str]:
     bbo = fetch_swissquote_bbo()
 
-    df15 = _fetch_yfinance_spot("15m", "15d")
-    if len(df15) >= 200:
-        df1h = _fetch_yfinance_spot("1h", "60d")
-        if len(df1h) >= 100:
+    # 0. Optional Pure Spot FX XAU/USD (if TWELVEDATA_API_KEY configured)
+    if TWELVEDATA_API_KEY:
+        try:
+            df15 = _fetch_twelvedata_spot("15m", 2500)
+            df1h = _fetch_twelvedata_spot("1h", 1000)
+            if len(df15) >= 300 and len(df1h) >= 120:
+                src = "Nominal (Pure FX: TwelveData XAU/USD + Swissquote BBO)"
+                logger.info(f"Data ingestion succeeded via [{src}] | 15M bars={len(df15)} | 1H bars={len(df1h)}")
+                return df15, df1h, bbo, src
+        except Exception as exc:
+            logger.warning(f"TwelveData XAU/USD feed skipped: {exc}")
+
+    # 1. Primary: yfinance XAUUSD=X
+    df15 = _fetch_yfinance_spot("15m", "30d")
+    if len(df15) >= 300:
+        df1h = _fetch_yfinance_spot("1h", "90d")
+        if len(df1h) >= 120:
             src = "Nominal (Primary: yfinance XAUUSD=X)"
             logger.info(f"Data ingestion succeeded via [{src}] | 15M bars={len(df15)} | 1H bars={len(df1h)}")
             return df15, df1h, bbo, src
-    logger.info("Feed [Nominal (Primary: yfinance XAUUSD=X)] unavailable or rate-limited; advancing failover...")
 
-    df15 = _fetch_yahoo_v8_http("15m", "15d")
-    if len(df15) >= 200:
-        df1h = _fetch_yahoo_v8_http("1h", "60d")
-        if len(df1h) >= 100:
+    # 2. Secondary: Fail-Fast Yahoo v8 HTTP
+    df15 = _fetch_yahoo_v8_http("15m", "30d")
+    if len(df15) >= 300:
+        df1h = _fetch_yahoo_v8_http("1h", "90d")
+        if len(df1h) >= 120:
             src = "Failover Active (Secondary: Yahoo v8 HTTP XAUUSD=X)"
             logger.info(f"Data ingestion succeeded via [{src}] | 15M bars={len(df15)} | 1H bars={len(df1h)}")
             return df15, df1h, bbo, src
-    logger.info("Feed [Failover Active (Secondary: Yahoo v8 HTTP XAUUSD=X)] unavailable or rate-limited; advancing failover...")
+    logger.info("Yahoo Spot feeds unavailable/rate-limited; advancing fast to paginated Spot Proxy...")
 
+    # 3. Tertiary: Paginated Binance Vision PAXGUSDT (2500 M15 / 1000 1H) + Swissquote BBO
     try:
-        df15 = _calibrate_spot_proxy(_fetch_binance_paxg("15m", 1000), bbo)
-        df1h = _calibrate_spot_proxy(_fetch_binance_paxg("1h", 750), bbo)
-        if len(df15) >= 200 and len(df1h) >= 100:
-            src = "Failover Active (Tertiary: Spot PAXG/XAUUSD + Swissquote BBO)"
+        df15 = _calibrate_spot_proxy(_fetch_binance_paxg_paginated("15m", 2500), bbo)
+        df1h = _calibrate_spot_proxy(_fetch_binance_paxg_paginated("1h", 1000), bbo)
+        if len(df15) >= 300 and len(df1h) >= 120:
+            src = "Failover Active (Tertiary: Paginated Spot PAXG/XAUUSD + Swissquote BBO)"
             logger.info(f"Data ingestion succeeded via [{src}] | 15M bars={len(df15)} | 1H bars={len(df1h)}")
             return df15, df1h, bbo, src
     except Exception as exc:
         logger.warning(f"Tertiary Binance Vision feed failed: {exc}")
 
+    # 4. Quaternary: Kraken PAXGUSD + Swissquote BBO
     try:
         df15 = _calibrate_spot_proxy(_fetch_kraken_paxg(15), bbo)
         df1h = _calibrate_spot_proxy(_fetch_kraken_paxg(60), bbo)
-        if len(df15) >= 150 and len(df1h) >= 80:
+        if len(df15) >= 220 and len(df1h) >= 80:
             src = "Failover Active (Quaternary: Kraken PAXGUSD + Swissquote BBO)"
             logger.info(f"Data ingestion succeeded via [{src}] | 15M bars={len(df15)} | 1H bars={len(df1h)}")
             return df15, df1h, bbo, src
@@ -708,7 +778,7 @@ def compute_indicators(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
     std20 = close.rolling(20).std().clip(lower=EPSILON)
     out["ZSCORE"] = (close - out["EMA20"]) / std20
 
-    # Volume Order Flow & 2-Bar Order Flow Momentum Acceleration
+    # Volume Order Flow & 2-Bar Momentum Acceleration
     bar_range = (high - low).clip(lower=EPSILON)
     clv = ((close - low) - (high - close)) / bar_range
     vol_safe = out["Volume"].replace(0, np.nan).ffill().fillna(1.0).clip(lower=EPSILON)
@@ -720,10 +790,7 @@ def compute_indicators(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
 
 
 def _evaluate_smc_pillar(df: pd.DataFrame, idx: int) -> tuple[float, str, str, float, float]:
-    """
-    Pillar 1 (Normalized 0-100, Weight 35%):
-    SMC Liquidity Sweep, Break of Structure (BOS), Fair Value Gap (FVG), & Swing Structure.
-    """
+    """Pillar 1 (Weight 35%): SMC Liquidity Sweep, BOS, FVG & Swing Structure."""
     w = df.iloc[max(0, idx - 35): idx + 1]
     if len(w) < 15:
         return 35.0, "NEUTRAL_RANGE", "NONE", float(df["Low"].iloc[idx]), float(df["High"].iloc[idx])
@@ -760,19 +827,10 @@ def _evaluate_smc_pillar(df: pd.DataFrame, idx: int) -> tuple[float, str, str, f
     return 35.0, "CONSOLIDATION_RANGE", "NONE", recent_swing_low, recent_swing_high
 
 
-def score_bar_confluence(
-    df15: pd.DataFrame,
-    df1h: pd.DataFrame,
-    idx15: int,
-    z_threshold: float,
-) -> dict:
+def score_bar_confluence(df15: pd.DataFrame, df1h: pd.DataFrame, idx15: int, z_threshold: float) -> dict:
     """
     Weighted SniperGate Confluence Engine (Sum = 100%):
-    - SMC (Market Structure):  35% (0.35)
-    - Order Flow Momentum:     30% (0.30)
-    - Z-Score Pullback:        15% (0.15)
-    - ATR/Volatility Regime:   10% (0.10)
-    - MTF Harmony (1H/15M):    10% (0.10)
+    SMC 35% | Order Flow 30% | Z-Score 15% | ATR/Volatility 10% | MTF Harmony 10%
     """
     row = df15.iloc[idx15]
     ts = df15.index[idx15]
@@ -789,10 +847,10 @@ def score_bar_confluence(
     of = float(row["ORDER_FLOW"])
     of_mom = float(row["OF_MOMENTUM"])
 
-    # 1. SMC (Market Structure) - Weight 35%
+    # 1. SMC Market Structure (35%)
     smc_norm, smc_state, smc_dir, swing_low, swing_high = _evaluate_smc_pillar(df15, idx15)
 
-    # 2. MTF Harmony (1H/15M) - Weight 10%
+    # 2. MTF Harmony 1H/15M (10%)
     h1_bull = float(h1_row["EMA20"]) > float(h1_row["EMA50"]) and float(h1_row["Close"]) > float(h1_row["EMA50"])
     h1_bear = float(h1_row["EMA20"]) < float(h1_row["EMA50"]) and float(h1_row["Close"]) < float(h1_row["EMA50"])
     m15_bull = ema20 > ema50
@@ -822,7 +880,7 @@ def score_bar_confluence(
     if smc_dir != "NONE" and smc_dir != bias:
         smc_norm = max(15.0, smc_norm - 55.0)
 
-    # 3. Order Flow Momentum & Delta - Weight 30%
+    # 3. Order Flow Momentum & Delta (30%)
     of_aligned = of if bias == "BUY" else -of
     mom_accel = (of_mom >= 0.02) if bias == "BUY" else (of_mom <= -0.02)
     if of_aligned >= 0.35:
@@ -838,10 +896,10 @@ def score_bar_confluence(
         of_norm = 10.0
         of_label = f"COUNTER_ORDERFLOW ({of:+.2f}, Δ{of_mom:+.2f})"
 
-    # 4. Z-Score Pullback & Anti-Chasing - Weight 15%
+    # 4. Z-Score Pullback & Anti-Chasing (15%)
     ext_atr = (close - ema20) / atr
     if bias == "BUY":
-        if -1.0 <= z <= 0.8 and abs(ext_atr) <= MAX_EXTENSION_ATR:
+        if -1.0 <= z <= 0.6 and abs(ext_atr) <= MAX_EXTENSION_ATR:
             z_norm = 100.0
         elif -z_threshold <= z < -1.0:
             z_norm = 72.0
@@ -850,7 +908,7 @@ def score_bar_confluence(
         else:
             z_norm = 45.0
     else:
-        if -0.8 <= z <= 1.0 and abs(ext_atr) <= MAX_EXTENSION_ATR:
+        if -0.6 <= z <= 1.0 and abs(ext_atr) <= MAX_EXTENSION_ATR:
             z_norm = 100.0
         elif 1.0 < z <= z_threshold:
             z_norm = 72.0
@@ -859,7 +917,7 @@ def score_bar_confluence(
         else:
             z_norm = 45.0
 
-    # 5. ATR/Volatility Expansion & Trigger Candle - Weight 10%
+    # 5. ATR/Volatility Expansion & Trigger Candle (10%)
     candle_bull = float(row["Close"]) > float(row["Open"])
     candle_bear = float(row["Close"]) < float(row["Open"])
     trigger_ok = (bias == "BUY" and candle_bull) or (bias == "SELL" and candle_bear)
@@ -893,6 +951,8 @@ def score_bar_confluence(
     return {
         "bias": bias,
         "score": total_score,
+        "bar_close": close,
+        "bar_time_utc": ts.to_pydatetime(),
         "smc_state": smc_state,
         "mtf_state": mtf_state,
         "of_label": of_label,
@@ -919,10 +979,31 @@ def score_bar_confluence(
 
 
 # ==============================================================================
-# SYNCHRONIZED GRID SEARCH BACKTESTER & PERFORMANCE CHART
+# SESSION GOVERNOR
+# ==============================================================================
+def evaluate_session_governor(now_utc: datetime, spread_usd: float) -> tuple[bool, str, str, int]:
+    wd = now_utc.weekday()
+    hh = now_utc.hour
+
+    if (wd == 4 and hh >= 22) or wd == 5 or (wd == 6 and hh < 22):
+        return False, "WEEKEND_MARKET_CLOSED", "WEEKEND_CLOSED", 99
+    if hh == 21:
+        return False, "DAILY_ROLLOVER_BLACKOUT (21:00-22:00 UTC)", "ROLLOVER_BLACKOUT", 99
+    if hh == 22:
+        return False, "ASIAN_OPEN_ILLIQUIDITY (22:00-23:00 UTC)", "ASIAN_OPEN_HOLD", 99
+    if spread_usd > MAX_ALLOWED_SPREAD_USD:
+        return False, f"SPREAD_GUARD_TRIGGERED (${spread_usd:.2f} > ${MAX_ALLOWED_SPREAD_USD:.2f})", "HIGH_SPREAD", 99
+
+    if 7 <= hh < 20:
+        return True, "SESSION_CLEAR", "LONDON_NY_ACTIVE", BASE_CONFLUENCE_THRESHOLD
+    return True, "SESSION_CLEAR", "ASIAN_SESSION_ACTIVE", max(BASE_CONFLUENCE_THRESHOLD + 8, 76)
+
+
+# ==============================================================================
+# COST-ADJUSTED SYNCHRONIZED GRID SEARCH BACKTESTER
 # ==============================================================================
 def run_synchronized_backtest(
-    df15_raw: pd.DataFrame, df1h_raw: pd.DataFrame, atr_period: int, z_threshold: float
+    df15_raw: pd.DataFrame, df1h_raw: pd.DataFrame, atr_period: int, z_threshold: float, spread_usd: float
 ) -> dict:
     df15 = compute_indicators(df15_raw, atr_period=atr_period)
     df1h = compute_indicators(df1h_raw, atr_period=atr_period)
@@ -930,11 +1011,17 @@ def run_synchronized_backtest(
     equity = [100.0]
 
     i = 210
-    n = len(df15)
+    n = len(df15) - 1  # Exclude live unclosed bar just like live execution
     while i < n - 12:
+        bar_dt = df15.index[i].to_pydatetime()
+        sess_ok, _, _, req_sc = evaluate_session_governor(bar_dt, spread_usd)
+        if not sess_ok:
+            i += 1
+            continue
+
         sig = score_bar_confluence(df15, df1h, i, z_threshold)
         if (
-            sig["score"] >= BASE_CONFLUENCE_THRESHOLD
+            sig["score"] >= req_sc
             and sig["priority_pillars_ok"]
             and sig["adx"] >= 18.0
             and sig["anti_chase_ok"]
@@ -944,6 +1031,8 @@ def run_synchronized_backtest(
             entry = float(df15["Close"].iloc[i])
             atr = sig["atr"]
             risk_dist = max(1.5 * atr, 3.0)
+            cost_r = (spread_usd + SIM_SLIPPAGE_USD) / risk_dist
+
             sl = entry - risk_dist if sig["bias"] == "BUY" else entry + risk_dist
             tp1 = entry + 1.5 * risk_dist if sig["bias"] == "BUY" else entry - 1.5 * risk_dist
             tp2 = entry + 2.5 * risk_dist if sig["bias"] == "BUY" else entry - 2.5 * risk_dist
@@ -958,32 +1047,32 @@ def run_synchronized_backtest(
                 lo = float(df15["Low"].iloc[j])
                 if sig["bias"] == "BUY":
                     if lo <= cur_sl:
-                        trade_r = 0.5 * 1.5 if tp1_hit else -1.0
+                        trade_r = (0.5 * 1.5 if tp1_hit else -1.0) - cost_r
                         exit_idx = j
                         break
                     if not tp1_hit and hi >= tp1:
                         tp1_hit = True
                         cur_sl = entry
                     if hi >= tp2:
-                        trade_r = 0.5 * 1.5 + 0.5 * 2.5
+                        trade_r = (0.5 * 1.5 + 0.5 * 2.5) - cost_r
                         exit_idx = j
                         break
                 else:
                     if hi >= cur_sl:
-                        trade_r = 0.5 * 1.5 if tp1_hit else -1.0
+                        trade_r = (0.5 * 1.5 if tp1_hit else -1.0) - cost_r
                         exit_idx = j
                         break
                     if not tp1_hit and lo <= tp1:
                         tp1_hit = True
                         cur_sl = entry
                     if lo <= tp2:
-                        trade_r = 0.5 * 1.5 + 0.5 * 2.5
+                        trade_r = (0.5 * 1.5 + 0.5 * 2.5) - cost_r
                         exit_idx = j
                         break
             else:
                 final_c = float(df15["Close"].iloc[exit_idx])
                 raw_r = ((final_c - entry) if sig["bias"] == "BUY" else (entry - final_c)) / risk_dist
-                trade_r = (0.5 * 1.5 + 0.5 * raw_r) if tp1_hit else raw_r
+                trade_r = ((0.5 * 1.5 + 0.5 * raw_r) if tp1_hit else raw_r) - cost_r
 
             trades_r.append(trade_r)
             equity.append(equity[-1] * (1.0 + 0.01 * trade_r))
@@ -1015,20 +1104,20 @@ def run_synchronized_backtest(
     }
 
 
-def grid_search_optimize(df15_raw: pd.DataFrame, df1h_raw: pd.DataFrame) -> dict:
+def grid_search_optimize(df15_raw: pd.DataFrame, df1h_raw: pd.DataFrame, spread_usd: float) -> dict:
     best = None
     best_obj = -999.0
     for atr_p in (10, 14, 20):
         for z_th in (1.5, 2.0, 2.5):
-            res = run_synchronized_backtest(df15_raw, df1h_raw, atr_p, z_th)
+            res = run_synchronized_backtest(df15_raw, df1h_raw, atr_p, z_th, spread_usd)
             obj = (res["exp"] * 10.0) + res["pf"] - (res["mdd"] * 0.25)
-            if res["trades"] < 3:
-                obj -= 5.0
+            if res["trades"] < 5:
+                obj -= 6.0
             if obj > best_obj:
                 best_obj = obj
                 best = res
     logger.info(
-        f"Grid Search Optimal Selected: ATR={best['atr']}, Z={best['z']} | "
+        f"Grid Search Optimal Selected (Cost-Adjusted): ATR={best['atr']}, Z={best['z']} | "
         f"Trades={best['trades']} | WR={best['wr']}% | PF={best['pf']:.2f} | "
         f"MDD={best['mdd']}% | Exp={best['exp']:+.2f}R"
     )
@@ -1040,11 +1129,11 @@ def save_backtest_chart(best_bt: dict, chart_path: str = CHART_PATH) -> None:
     fig.patch.set_facecolor("#0d1117")
     ax.set_facecolor("#161b22")
     eq = best_bt.get("equity", [100.0])
-    ax.plot(range(len(eq)), eq, color="#f0b90b", linewidth=2.0, label="Equity Curve (%)")
+    ax.plot(range(len(eq)), eq, color="#f0b90b", linewidth=2.0, label="Net Equity Curve (%)")
     ax.axhline(100.0, color="#8b949e", linestyle="--", linewidth=0.9)
     ax.set_title(
         f"APEX-QUANT-OMNI {BOT_VERSION} | ATR={best_bt['atr']} Z={best_bt['z']} | "
-        f"WR={best_bt['wr']}% | PF={best_bt['pf']} | Exp={best_bt['exp']:+.2f}R",
+        f"N={best_bt['trades']} WR={best_bt['wr']}% PF={best_bt['pf']} Exp={best_bt['exp']:+.2f}R",
         color="#e6edf3", fontsize=10, pad=10,
     )
     ax.set_xlabel("Closed Trades", color="#8b949e", fontsize=9)
@@ -1059,24 +1148,114 @@ def save_backtest_chart(best_bt: dict, chart_path: str = CHART_PATH) -> None:
 
 
 # ==============================================================================
-# SESSION GOVERNOR & RISK SIZING
+# ACTIVE TRADE LIFECYCLE TRACKER & ANTI-DUPLICATE COOLDOWN
 # ==============================================================================
-def evaluate_session_governor(now_utc: datetime, spread_usd: float) -> tuple[bool, str, str, int]:
-    wd = now_utc.weekday()
-    hh = now_utc.hour
+def monitor_active_trades(
+    conn: sqlite3.Connection, df15_raw: pd.DataFrame, bid: float, ask: float, now_utc: datetime
+) -> dict | None:
+    """
+    Tracks any OPEN or TP1_BE signal chronologically bar-by-bar + live BBO.
+    Notifies Telegram on TP1 (BE move), TP2, TP3, or SL exit.
+    Returns remaining active trade dict if still open, else None.
+    """
+    row = conn.execute(
+        "SELECT id, opened_at_utc, side, entry_price, initial_sl, current_sl, tp1, tp2, tp3, lot_size, status, tp1_hit "
+        "FROM active_trades WHERE status IN ('OPEN', 'TP1_BE') ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
 
-    if (wd == 4 and hh >= 22) or wd == 5 or (wd == 6 and hh < 22):
-        return False, "WEEKEND_MARKET_CLOSED", "WEEKEND_CLOSED", 99
-    if hh == 21:
-        return False, "DAILY_ROLLOVER_BLACKOUT (21:00-22:00 UTC)", "ROLLOVER_BLACKOUT", 99
-    if hh == 22:
-        return False, "ASIAN_OPEN_ILLIQUIDITY (22:00-23:00 UTC)", "ASIAN_OPEN_HOLD", 99
-    if spread_usd > MAX_ALLOWED_SPREAD_USD:
-        return False, f"SPREAD_GUARD_TRIGGERED (${spread_usd:.2f} > ${MAX_ALLOWED_SPREAD_USD:.2f})", "HIGH_SPREAD", 99
+    tid, opened_str, side, entry, init_sl, cur_sl, tp1, tp2, tp3, lot_sz, status, tp1_hit = row
+    opened_dt = datetime.fromisoformat(opened_str).astimezone(timezone.utc)
+    bars_since = df15_raw[df15_raw.index > opened_dt]
 
-    if 7 <= hh < 20:
-        return True, "SESSION_CLEAR", "LONDON_NY_ACTIVE", BASE_CONFLUENCE_THRESHOLD
-    return True, "SESSION_CLEAR", "ASIAN_SESSION_ACTIVE", max(BASE_CONFLUENCE_THRESHOLD + 8, 76)
+    price_steps = [(float(r["High"]), float(r["Low"])) for _, r in bars_since.iterrows()]
+    live_px = bid if side == "BUY" else ask
+    price_steps.append((live_px, live_px))
+
+    closed_reason = None
+    exit_px = live_px
+    realized_r = 0.0
+    just_hit_tp1 = False
+
+    for hi, lo in price_steps:
+        if side == "BUY":
+            if lo <= cur_sl:
+                closed_reason = "CLOSED_BE" if tp1_hit else "CLOSED_SL"
+                exit_px = cur_sl
+                realized_r = 0.75 if tp1_hit else -1.0
+                break
+            if not tp1_hit and hi >= tp1:
+                tp1_hit = 1
+                cur_sl = entry
+                status = "TP1_BE"
+                just_hit_tp1 = True
+            if hi >= tp2:
+                closed_reason = "CLOSED_TP2"
+                exit_px = tp2
+                realized_r = 2.00
+                break
+        else:
+            if hi >= cur_sl:
+                closed_reason = "CLOSED_BE" if tp1_hit else "CLOSED_SL"
+                exit_px = cur_sl
+                realized_r = 0.75 if tp1_hit else -1.0
+                break
+            if not tp1_hit and lo <= tp1:
+                tp1_hit = 1
+                cur_sl = entry
+                status = "TP1_BE"
+                just_hit_tp1 = True
+            if lo <= tp2:
+                closed_reason = "CLOSED_TP2"
+                exit_px = tp2
+                realized_r = 2.00
+                break
+
+    if closed_reason:
+        conn.execute(
+            "UPDATE active_trades SET status = ?, current_sl = ?, tp1_hit = ?, closed_at_utc = ?, exit_price = ?, realized_r = ? WHERE id = ?",
+            (closed_reason, cur_sl, tp1_hit, now_utc.isoformat(), exit_px, realized_r, tid),
+        )
+        conn.commit()
+        tag = "✅" if realized_r > 0 else "❌"
+        msg = (
+            f"{tag} <b>TRADE UPDATE #{tid} — {_esc(side)} XAUUSD</b>\n"
+            f"<b>Status:</b> <code>{_esc(closed_reason)}</code> (<code>{realized_r:+.2f}R</code>)\n"
+            f"<b>Entry:</b> <code>{entry:.2f}</code> → <b>Exit:</b> <code>{exit_px:.2f}</code>"
+        )
+        send_telegram_message(msg)
+        logger.info(f"Active Trade #{tid} closed: {closed_reason} @ {exit_px:.2f} ({realized_r:+.2f}R)")
+        return None
+
+    if just_hit_tp1:
+        conn.execute(
+            "UPDATE active_trades SET status = ?, current_sl = ?, tp1_hit = 1 WHERE id = ?",
+            (status, cur_sl, tid),
+        )
+        conn.commit()
+        msg = (
+            f"🎯 <b>TP1 HIT #{tid} — {_esc(side)} XAUUSD</b>\n"
+            f"<b>TP1:</b> <code>{tp1:.2f}</code> tersentuh! SL digeser ke Breakeven <code>{entry:.2f}</code>."
+        )
+        send_telegram_message(msg)
+        logger.info(f"Active Trade #{tid} hit TP1 @ {tp1:.2f}; SL trailed to BE {entry:.2f}")
+
+    return {"id": tid, "side": side, "entry": entry, "sl": cur_sl, "tp1": tp1, "tp2": tp2, "status": status}
+
+
+def register_active_trade(
+    conn: sqlite3.Connection, now_utc: datetime, side: str, entry: float, sl: float, tp1: float, tp2: float, tp3: float, lot_sz: float, score: int
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO active_trades (opened_at_utc, side, entry_price, initial_sl, current_sl, tp1, tp2, tp3, lot_size, score, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+        """,
+        (now_utc.isoformat(), side, entry, sl, sl, tp1, tp2, tp3, lot_sz, score),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
 
 
 # ==============================================================================
@@ -1089,9 +1268,7 @@ def _post_with_backoff(url: str, json_payload: dict | None = None, files=None, d
         try:
             resp = requests.post(url, json=json_payload, files=files, data=data, timeout=15)
             last_resp = resp
-            if 200 <= resp.status_code < 300:
-                return resp
-            if resp.status_code == 400:
+            if 200 <= resp.status_code < 300 or resp.status_code == 400:
                 return resp
             logger.warning(f"Webhook HTTP {resp.status_code} ({resp.text[:120]}); retrying in {delay}s...")
         except Exception as exc:
@@ -1116,9 +1293,7 @@ def send_telegram_message(text_html: str, chat_id: str | None = None) -> bool:
     if resp is not None and resp.status_code == 400:
         logger.warning(f"Telegram HTML rejected ({resp.text[:140]}); falling back to plain text...")
         plain = re.sub(r"<[^>]+>", "", text_html)
-        resp2 = _post_with_backoff(url, json_payload={
-            "chat_id": target, "text": plain, "disable_web_page_preview": True,
-        })
+        resp2 = _post_with_backoff(url, json_payload={"chat_id": target, "text": plain, "disable_web_page_preview": True})
         return resp2 is not None and 200 <= resp2.status_code < 300
     status = resp.status_code if resp is not None else "None"
     logger.warning(f"Telegram sendMessage failed: status={status}")
@@ -1167,6 +1342,7 @@ def build_telegram_signal_card(
     session_name: str,
     news_gov: dict,
     best_bt: dict,
+    active_trade: dict | None,
 ) -> str:
     if news_gov["upcoming"]:
         nxt = news_gov["upcoming"][0]
@@ -1192,16 +1368,23 @@ def build_telegram_signal_card(
             f"<b>Entry:</b> <code>{entry:.2f}</code> | <b>SL:</b> <code>{sl:.2f}</code>\n"
             f"<b>TP1:</b> <code>{tp1:.2f}</code> | <b>TP2:</b> <code>{tp2:.2f}</code> | <b>TP3:</b> <code>{tp3:.2f}</code>\n"
             f"<b>Risk:</b> Lot <code>{lot_out:.2f}</code> (<code>${risk_out:.0f}</code>) | Trailing: <code>TP1 BE</code> | Spr <code>${spread_usd:.2f}</code>\n"
-            f"<b>News:</b> {_esc(news_short)} | <b>BT:</b> WR <code>{best_bt['wr']}%</code> PF <code>{best_bt['pf']}</code>"
+            f"<b>News:</b> {_esc(news_short)} | <b>BT:</b> N={best_bt['trades']} WR <code>{best_bt['wr']}%</code> PF <code>{best_bt['pf']}</code>"
+        )
+
+    pos_line = ""
+    if active_trade:
+        pos_line = (
+            f"\n<b>Posisi Aktif #{active_trade['id']}:</b> <code>{_esc(active_trade['side'])} @ {active_trade['entry']:.2f}</code> "
+            f"(SL <code>{active_trade['sl']:.2f}</code> | <code>{_esc(active_trade['status'])}</code>)"
         )
 
     return (
         f"🟡 <b>XAUUSD HOLD</b> | Score <code>{sig['score']}/100</code> (Req&gt;={req_score})\n"
         f"<b>Spot:</b> <code>{bid:.2f} / {ask:.2f}</code> (Spr <code>${spread_usd:.2f}</code>)\n"
         f"<b>Bias ({_esc(bias)}):</b> {_esc(sniper_note)}\n"
-        f"<b>Sesi:</b> <code>{_esc(session_name)}</code>\n"
-        f"<b>News:</b> {_esc(news_short)}\n"
-        f"<b>BT:</b> WR <code>{best_bt['wr']}%</code> | PF <code>{best_bt['pf']}</code> | Exp <code>{best_bt['exp']:+.2f}R</code>"
+        f"<b>Sesi:</b> <code>{_esc(session_name)}</code> | <b>News:</b> {_esc(news_short)}\n"
+        f"<b>BT (~1Bln):</b> N={best_bt['trades']} WR <code>{best_bt['wr']}%</code> PF <code>{best_bt['pf']}</code> Exp <code>{best_bt['exp']:+.2f}R</code>"
+        f"{pos_line}"
     )
 
 
@@ -1227,18 +1410,24 @@ def run_analysis_cycle(
     ask = bbo["ask"] if bbo else bid
     spread_usd = bbo["spread"] if bbo else 0.50
 
-    # 3. Synchronized Grid Search & Chart Generation
-    best_bt = grid_search_optimize(df15_raw, df1h_raw)
+    # 3. Active Position Lifecycle Check (TP1->BE / TP2 / SL)
+    active_trade = monitor_active_trades(conn, df15_raw, bid, ask, now_utc)
+
+    # 4. Extended Cost-Adjusted Synchronized Grid Search & Chart
+    best_bt = grid_search_optimize(df15_raw, df1h_raw, spread_usd)
     save_backtest_chart(best_bt, CHART_PATH)
 
+    # 5. Closed-Candle (iloc[-2]) Confluence Evaluation (Zero Repaint / Zero Volume Bias)
     df15 = compute_indicators(df15_raw, atr_period=best_bt["atr"])
     df1h = compute_indicators(df1h_raw, atr_period=best_bt["atr"])
-    sig = score_bar_confluence(df15, df1h, len(df15) - 1, best_bt["z"])
+    closed_idx = len(df15) - 2
+    sig = score_bar_confluence(df15, df1h, closed_idx, best_bt["z"])
 
-    # 4. Hybrid Structural-ATR Risk Levels
+    # 6. Hybrid Structural-ATR Risk Levels + Live Entry Drift Check
     bias = sig["bias"]
     entry = ask if bias == "BUY" else bid
     atr = sig["atr"]
+    drift_atr = abs(entry - sig["bar_close"]) / max(atr, EPSILON)
     struct_buf = max(1.5 * atr, abs(entry - (sig["swing_low"] if bias == "BUY" else sig["swing_high"])) + 0.5 * atr)
     sl_dist = min(max(struct_buf, 1.5 * atr), 2.5 * atr)
 
@@ -1256,7 +1445,7 @@ def run_analysis_cycle(
     risk_usd = round(ACCOUNT_BALANCE * (RISK_PERCENT / 100.0), 2)
     lot_size = round(max(0.01, min(5.0, risk_usd / max(sl_dist * 100.0, EPSILON))), 2)
 
-    # 5. Dual Governors + Weighted SniperGate
+    # 7. Dual Governors + Weighted SniperGate + Anti-Duplicate Position Cooldown
     session_ok, session_reason, session_name, req_score = evaluate_session_governor(now_utc, spread_usd)
 
     if news_gov["hard_blackout"]:
@@ -1267,6 +1456,14 @@ def run_analysis_cycle(
         decision = "SESSION HOLD"
         sniper_note = session_reason
         lot_out, risk_out = 0.0, 0.0
+    elif active_trade and active_trade["side"] == bias:
+        decision = "POSITION ACTIVE / HOLD"
+        sniper_note = f"Trade #{active_trade['id']} ({bias}) masih {active_trade['status']} (anti-double entry)"
+        lot_out, risk_out = 0.0, 0.0
+    elif drift_atr > MAX_ENTRY_DRIFT_ATR:
+        decision = "NEUTRAL / HOLD"
+        sniper_note = f"Entry drift terlalu jauh ({drift_atr:.2f} ATR dari close M15)"
+        lot_out, risk_out = lot_size, risk_usd
     elif sig["smc_norm"] < MIN_PRIORITY_PILLAR_NORM:
         decision = "NEUTRAL / HOLD"
         sniper_note = f"SMC Structure lemah ({sig['smc_norm']:.0f}/{MIN_PRIORITY_PILLAR_NORM:.0f})"
@@ -1295,18 +1492,19 @@ def run_analysis_cycle(
         decision = f"VERIFIED {bias}"
         sniper_note = "ALL_WEIGHTED_SNIPER_GATES_PASSED"
         lot_out, risk_out = lot_size, risk_usd
+        tid = register_active_trade(conn, now_utc, bias, entry, sl, tp1, tp2, tp3, lot_out, sig["score"])
+        active_trade = {"id": tid, "side": bias, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "status": "OPEN"}
 
-    # 6. Build Clean Telegram Card
+    # 8. Build Clean Telegram Card & Route Delivery
     msg_html = build_telegram_signal_card(
         decision=decision, bias=bias, sig=sig, req_score=req_score,
         bid=bid, ask=ask, spread_usd=spread_usd,
         entry=entry, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
         lot_out=lot_out, risk_out=risk_out,
         sniper_note=sniper_note, session_name=session_name,
-        news_gov=news_gov, best_bt=best_bt,
+        news_gov=news_gov, best_bt=best_bt, active_trade=active_trade,
     )
 
-    # 7. Notification Routing (Avoid Duplicate Send When /check Already Replied)
     is_verified_op = decision.startswith("VERIFIED")
     should_send = (
         notify_mode == "command"
@@ -1325,15 +1523,11 @@ def run_analysis_cycle(
             webhook_status = "Delivered via Exponential Backoff" if ok_tg else "Telegram Delivery Failed"
     elif suppress_hold_notify and FORCE_NOTIFY:
         webhook_status = "Skipped Duplicate (Already Replied via /check)"
-        if not DISCORD_WEBHOOK_URL:
-            logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery.")
-    elif not DISCORD_WEBHOOK_URL:
+
+    if not DISCORD_WEBHOOK_URL:
         logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery.")
 
-    if notify_mode != "command" and not DISCORD_WEBHOOK_URL and should_send:
-        logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery.")
-
-    # 8. Full Forensic Audit Log (GitHub Actions Console + SQLite)
+    # 9. Full Forensic Audit Log (GitHub Actions Console + SQLite)
     forensic_audit_log(conn, {
         "timestamp_utc": now_utc.isoformat(),
         "decision": decision,
@@ -1355,13 +1549,13 @@ def run_analysis_cycle(
     })
 
     logger.info("========== FORENSIC AUDIT LOG ==========")
-    logger.info(f"Asset=XAUUSD (SPOT GOLD) | Decision={decision} | Score={sig['score']}/100 (Req>={req_score}) | Source={data_src}")
-    logger.info(f"WeightedPillars: {sig['weighted_breakdown']}")
+    logger.info(f"Asset=XAUUSD (SPOT GOLD) | Decision={decision} | Score={sig['score']}/100 (Req>={req_score}) | ClosedBar={sig['bar_time_utc'].strftime('%H:%M UTC')}")
+    logger.info(f"WeightedPillars: {sig['weighted_breakdown']} | Drift={drift_atr:.2f} ATR | Source={data_src}")
     logger.info(f"Entry={entry:.2f} | SL={sl:.2f} | TP1={tp1:.2f} | TP2={tp2:.2f} | TP3={tp3:.2f} | Bid={bid:.2f} Ask={ask:.2f} Spread=${spread_usd:.2f}")
     logger.info(f"Z-Score={sig['z_score']:.4f} | ADX={sig['adx']:.2f} | ATR={atr:.4f} (Ratio={sig['atr_ratio']:.2f}) | SMC={sig['smc_state']} | OrderFlow={sig['of_label']} | MTF={sig['mtf_state']}")
     logger.info(f"SniperGate={sniper_note} | NewsGovernor={news_gov['status_code']} | NewsSrc={news_gov['source']} | Session={session_name}")
-    logger.info(f"GridSearch(ATR={best_bt['atr']}, Z={best_bt['z']}) | WR={best_bt['wr']}% | PF={best_bt['pf']:.2f} | MDD={best_bt['mdd']}% | Exp={best_bt['exp']:+.2f}R")
-    logger.info(f"Lot={lot_out:.2f} | RiskUSD=${risk_out:.2f} | Trailing=Active @ TP1 Breakeven | Webhook={webhook_status}")
+    logger.info(f"GridSearch(ATR={best_bt['atr']}, Z={best_bt['z']}, N={best_bt['trades']}) | WR={best_bt['wr']}% | PF={best_bt['pf']:.2f} | MDD={best_bt['mdd']}% | Exp={best_bt['exp']:+.2f}R")
+    logger.info(f"Lot={lot_out:.2f} | RiskUSD=${risk_out:.2f} | ActiveTrade={active_trade['id'] if active_trade else 'None'} | Webhook={webhook_status}")
     logger.info("========================================")
 
     return {"decision": decision, "score": sig["score"], "news_gov": news_gov, "best_bt": best_bt}
@@ -1401,16 +1595,27 @@ def _build_audit_reply(conn: sqlite3.Connection) -> str:
         "SELECT timestamp_utc, decision, score, entry_price, spread_usd "
         "FROM signals_audit ORDER BY id DESC LIMIT 5"
     ).fetchall()
+    closed = conn.execute(
+        "SELECT status, realized_r FROM active_trades WHERE status LIKE 'CLOSED_%'"
+    ).fetchall()
+
+    lines = ["📜 <b>5 AUDIT &amp; FORWARD-TEST</b>"]
+    if closed:
+        wins = sum(1 for _, r in closed if r > 0)
+        net_r = sum(r for _, r in closed)
+        lines.append(f"<b>Live Forward:</b> {len(closed)} Trades | WR {100.0 * wins / len(closed):.1f}% | Net <code>{net_r:+.2f}R</code>\n")
+    else:
+        lines.append("<b>Live Forward:</b> Belum ada trade tertutup\n")
+
     if not rows:
-        return "📜 Belum ada riwayat audit tersimpan."
-    lines = ["📜 <b>5 AUDIT TERAKHIR</b>"]
-    for ts, dec, sc, ent, spr in rows:
-        lines.append(f"• <code>{_esc(ts[11:16])}Z</code> | <b>{_esc(dec)}</b> ({sc}) @ <code>{ent:.2f}</code> (${spr:.2f})")
+        lines.append("Belum ada riwayat audit tersimpan.")
+    else:
+        for ts, dec, sc, ent, spr in rows:
+            lines.append(f"• <code>{_esc(ts[11:16])}Z</code> | <b>{_esc(dec)}</b> ({sc}) @ <code>{ent:.2f}</code> (${spr:.2f})")
     return "\n".join(lines)
 
 
 def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -> bool:
-    """Processes pending Telegram commands. Returns True if /check already ran and replied."""
     if not TELEGRAM_BOT_TOKEN:
         return False
     offset_str = get_state(conn, "tg_update_offset", "0")
@@ -1506,7 +1711,7 @@ def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -
                 "/news — Jadwal High-Impact USD\n"
                 "/status — Sesi &amp; spread live\n"
                 "/chart — Grafik backtest\n"
-                "/audit — 5 sinyal terakhir"
+                "/audit — 5 sinyal &amp; forward-test live"
             )
             send_telegram_message(help_msg, chat_id=chat_id)
 
