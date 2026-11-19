@@ -2,9 +2,17 @@
 Forensic Invariant & Multi-Disciplinary Verification Suite for APEX-QUANT-OMNI v78.0
 Validates causality, econophysics bounds, microstructure VWAP/BVC, Kelly sizing, and execution parity.
 """
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
+_THIS_DIR = Path(__file__).resolve().parent
+for _candidate in (_THIS_DIR, _THIS_DIR.parent):
+    if (_candidate / "bot.py").exists() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
 
 import bot
 
