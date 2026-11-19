@@ -21,6 +21,19 @@ on:
         options:
           - "false"
           - "true"
+      require_positive_backtest:
+        description: "Gate signals on positive Out-of-Sample/Backtest expectancy"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+# Prevent race conditions between scheduled cron and manual workflow_dispatch runs
+concurrency:
+  group: apex-quant-omni-sqlite-state
+  cancel-in-progress: false
 
 permissions:
   actions: read
@@ -29,7 +42,7 @@ permissions:
 jobs:
   run-signal-engine:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Checkout repository
@@ -46,13 +59,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore SQLite state from latest artifact
+      - name: Run Forensic Invariant Suite
+        run: |
+          if [ -f tests/test_forensic_invariants.py ]; then
+            pytest -q tests/test_forensic_invariants.py
+          fi
+
+      - name: Restore SQLite state from latest completed artifact
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RUN_ID=$(gh run list --workflow="signal_bot.yml" --status=success --limit=1 --json databaseId --jq '.[0].databaseId // empty')
+          RUN_ID=$(gh run list \
+            --branch "${{ github.ref_name }}" \
+            --status completed \
+            --limit 10 \
+            --json databaseId,conclusion \
+            --jq '[.[] | select(.conclusion == "success" or .conclusion == "failure")][0].databaseId // empty')
           if [ -n "$RUN_ID" ]; then
+            echo "Restoring apex-quant-artifacts from run_id=$RUN_ID"
             gh run download "$RUN_ID" --name apex-quant-artifacts --dir . || true
             ls -la trading_signals.db backtest_performance.png 2>/dev/null || true
           fi
@@ -65,13 +90,25 @@ jobs:
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           ACCOUNT_BALANCE: "10000.0"
           RISK_PERCENT: "1.0"
+          XAU_CONTRACT_OZ: "100.0"
           CONFLUENCE_THRESHOLD: "68"
           MAX_ALLOWED_SPREAD_USD: "3.00"
+          MAX_DATA_STALE_MINUTES: "45"
+          MAX_DAILY_LOSS_R: "3.0"
+          MIN_BT_TRADES: "8"
+          PURGED_EMBARGO_BARS: "16"
+          ENABLE_MACRO_DRIVERS: "true"
+          ENABLE_VOL_KELLY_SIZING: "true"
+          MIN_KAUFMAN_ER: "0.18"
+          MAX_SHANNON_ENTROPY: "0.94"
           NEWS_BLACKOUT_BEFORE_MIN: "45"
           NEWS_BLACKOUT_AFTER_MIN: "30"
           NEWS_CACHE_TTL_MINUTES: "15"
+          NEWS_DEGRADED_TTL_MINUTES: "2"
           BOT_MODE: ${{ github.event.inputs.bot_mode || 'oneshot' }}
           FORCE_NOTIFY: ${{ github.event.inputs.force_notify || 'false' }}
+          REQUIRE_POSITIVE_BACKTEST: ${{ github.event.inputs.require_positive_backtest || 'true' }}
+          MAX_POLLING_RUNTIME_SEC: "480"
           MPLBACKEND: "Agg"
         run: |
           python bot.py --mode "${BOT_MODE}"
