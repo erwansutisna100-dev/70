@@ -821,8 +821,8 @@ def ingest_spot_gold_data(now_utc: datetime) -> tuple[pd.DataFrame, pd.DataFrame
 
     if TWELVEDATA_API_KEY:
         try:
-            df15 = _fetch_twelvedata_spot("15m", 2500)
-            df1h = _fetch_twelvedata_spot("1h", 1000)
+            df15 = _fetch_twelvedata_spot("15m", 5000)
+            df1h = _fetch_twelvedata_spot("1h", 1800)
             if len(df15) >= 300 and len(df1h) >= 120 and _check_cross_feed_sanity(df15, bbo):
                 src = "Nominal (Pure FX: TwelveData XAU/USD UTC + Swissquote BBO)"
                 logger.info(f"Data ingestion succeeded via [{src}] | 15M bars={len(df15)} | 1H bars={len(df1h)}")
@@ -1151,9 +1151,9 @@ def _evaluate_causal_macro_pillar(
     for key in ("dxy", "tnx"):
         df_m = macro_data.get(key)
         if df_m is not None and not df_m.empty:
-            sl = df_m[df_m.index <= cutoff]
-            if not sl.empty:
-                z_readings[key] = float(sl["MACRO_Z"].iloc[-1])
+            pos = int(df_m.index.searchsorted(cutoff, side="right"))
+            if pos > 0:
+                z_readings[key] = float(df_m["MACRO_Z"].iloc[pos - 1])
 
     if not z_readings:
         return 55.0, "MACRO_NEUTRAL_WAIT"
@@ -1186,7 +1186,7 @@ def score_bar_confluence(
     ts = df15.index[idx15]
 
     cutoff_1h = ts - pd.Timedelta(minutes=45)
-    h1_slice = df1h[df1h.index <= cutoff_1h]
+    h1_pos = int(df1h.index.searchsorted(cutoff_1h, side="right")) if not df1h.empty else 0
 
     close = float(row["Close"])
     ema20 = float(row["EMA20"])
@@ -1209,13 +1209,13 @@ def score_bar_confluence(
     smc_norm, smc_state, smc_dir, swing_low, swing_high = _evaluate_smc_pillar(df15, idx15)
 
     # 2. Causal MTF Harmony 1H/15M + Garman-Klass Vol (10%)
-    if h1_slice.empty:
+    if h1_pos <= 0:
         bias = smc_dir if smc_dir in ("BUY", "SELL") else "NEUTRAL"
         mtf_norm = 0.0
         mtf_state = "1H_INSUFFICIENT_HISTORY"
         htf_aligned = False
     else:
-        h1_row = h1_slice.iloc[-1]
+        h1_row = df1h.iloc[h1_pos - 1]
         h1_bull = float(h1_row["EMA20"]) > float(h1_row["EMA50"]) and float(h1_row["Close"]) > float(h1_row["EMA50"])
         h1_bear = float(h1_row["EMA20"]) < float(h1_row["EMA50"]) and float(h1_row["Close"]) < float(h1_row["EMA50"])
         m15_bull = ema20 > ema50
@@ -1598,9 +1598,11 @@ def run_synchronized_backtest(
     macro_data: dict[str, pd.DataFrame] | None = None,
     start_idx: int = 210,
     end_idx: int | None = None,
+    precomputed_df15: pd.DataFrame | None = None,
+    precomputed_df1h: pd.DataFrame | None = None,
 ) -> dict:
-    df15 = compute_indicators(df15_raw, atr_period=atr_period)
-    df1h = compute_indicators(df1h_raw, atr_period=atr_period)
+    df15 = precomputed_df15 if precomputed_df15 is not None else compute_indicators(df15_raw, atr_period=atr_period)
+    df1h = precomputed_df1h if precomputed_df1h is not None else compute_indicators(df1h_raw, atr_period=atr_period)
     trades_r: list[float] = []
 
     n_limit = (len(df15) - 1) if end_idx is None else min(end_idx, len(df15) - 1)
@@ -1693,12 +1695,17 @@ def grid_search_optimize(
 
     best_is = None
     best_obj = -9999.0
+    indicator_cache: dict[int, tuple[pd.DataFrame, pd.DataFrame]] = {}
 
     for atr_p in (10, 14, 20):
+        df15_ind = compute_indicators(df15_raw, atr_period=atr_p)
+        df1h_ind = compute_indicators(df1h_raw, atr_period=atr_p)
+        indicator_cache[atr_p] = (df15_ind, df1h_ind)
         for z_th in (1.5, 2.0, 2.5):
             res_is = run_synchronized_backtest(
                 df15_raw, df1h_raw, atr_p, z_th, spread_usd,
                 macro_data=macro_data, start_idx=210, end_idx=split_idx,
+                precomputed_df15=df15_ind, precomputed_df1h=df1h_ind,
             )
             obj = (res_is["exp"] * 10.0) + min(res_is["pf"], 4.0) + min(res_is["sqn"], 3.0) - (res_is["mdd"] * 0.25)
             if res_is["trades"] < MIN_BT_TRADES:
@@ -1707,14 +1714,17 @@ def grid_search_optimize(
                 best_obj = obj
                 best_is = res_is
 
+    best_df15, best_df1h = indicator_cache[best_is["atr"]]
     best_full = run_synchronized_backtest(
         df15_raw, df1h_raw, best_is["atr"], best_is["z"], spread_usd,
         macro_data=macro_data, start_idx=210, end_idx=total_bars,
+        precomputed_df15=best_df15, precomputed_df1h=best_df1h,
     )
     if oos_start < total_bars - 15:
         oos = run_synchronized_backtest(
             df15_raw, df1h_raw, best_is["atr"], best_is["z"], spread_usd,
             macro_data=macro_data, start_idx=oos_start, end_idx=total_bars,
+            precomputed_df15=best_df15, precomputed_df1h=best_df1h,
         )
     else:
         oos = {"trades": 0, "wr": 0.0, "pf": 1.0, "mdd": 0.0, "exp": 0.0, "sqn": 0.0}
@@ -1726,6 +1736,8 @@ def grid_search_optimize(
     best_full["oos_pf"] = oos["pf"]
     best_full["oos_exp"] = oos["exp"]
     best_full["oos_sqn"] = oos.get("sqn", 0.0)
+    best_full["_df15"] = best_df15
+    best_full["_df1h"] = best_df1h
 
     logger.info(
         f"Purged Walk-Forward (ATR={best_full['atr']}, Z={best_full['z']}): "
@@ -2102,8 +2114,12 @@ def run_analysis_cycle(
         or (best_bt["trades"] >= 8 and best_bt["exp"] <= 0.0)
     )
 
-    df15 = compute_indicators(df15_raw, atr_period=best_bt["atr"])
-    df1h = compute_indicators(df1h_raw, atr_period=best_bt["atr"])
+    df15 = best_bt.pop("_df15", None)
+    df1h = best_bt.pop("_df1h", None)
+    if df15 is None:
+        df15 = compute_indicators(df15_raw, atr_period=best_bt["atr"])
+    if df1h is None:
+        df1h = compute_indicators(df1h_raw, atr_period=best_bt["atr"])
     closed_idx, is_stale, closed_age_min = select_closed_bar_index(df15, now_utc)
     sig = score_bar_confluence(df15, df1h, closed_idx, best_bt["z"], macro_data=macro_data)
 
@@ -2163,39 +2179,39 @@ def run_analysis_cycle(
     elif not sig["htf_aligned"]:
         decision = "NEUTRAL / HOLD"
         sniper_note = f"Kontra tren 1H ({sig['mtf_state']})"
-        lot_out, risk_out = lot_size, actual_risk_usd
+        lot_out, risk_out = 0.0, 0.0
     elif not sig["regime_quality_ok"]:
         decision = "NEUTRAL / HOLD"
         sniper_note = f"Rezim noise/choppy (ER={sig['kaufman_er']:.2f}, Ent={sig['entropy']:.2f}, H={sig['hurst']:.2f})"
-        lot_out, risk_out = lot_size, actual_risk_usd
+        lot_out, risk_out = 0.0, 0.0
     elif drift_atr > MAX_ENTRY_DRIFT_ATR:
         decision = "NEUTRAL / HOLD"
         sniper_note = f"Entry drift terlalu jauh ({drift_atr:.2f} ATR dari close M15)"
-        lot_out, risk_out = lot_size, actual_risk_usd
+        lot_out, risk_out = 0.0, 0.0
     elif sig["smc_norm"] < MIN_PRIORITY_PILLAR_NORM:
         decision = "NEUTRAL / HOLD"
         sniper_note = f"SMC Structure lemah ({sig['smc_norm']:.0f}/{MIN_PRIORITY_PILLAR_NORM:.0f})"
-        lot_out, risk_out = lot_size, actual_risk_usd
+        lot_out, risk_out = 0.0, 0.0
     elif sig["of_norm"] < MIN_PRIORITY_PILLAR_NORM or not sig["of_ok"]:
         decision = "NEUTRAL / HOLD"
         sniper_note = f"OrderFlow belum terkonfirmasi ({sig['order_flow']:+.2f})"
-        lot_out, risk_out = lot_size, actual_risk_usd
+        lot_out, risk_out = 0.0, 0.0
     elif sig["score"] < req_score:
         decision = "NEUTRAL / HOLD"
         sniper_note = f"Skor {sig['score']} belum mencapai Req {req_score}"
-        lot_out, risk_out = lot_size, actual_risk_usd
+        lot_out, risk_out = 0.0, 0.0
     elif sig["adx"] < 20.0:
         decision = "NEUTRAL / HOLD"
         sniper_note = f"ADX lemah ({sig['adx']:.1f} below 20.0)"
-        lot_out, risk_out = lot_size, actual_risk_usd
+        lot_out, risk_out = 0.0, 0.0
     elif not sig["anti_chase_ok"]:
         decision = "NEUTRAL / HOLD"
         sniper_note = f"Harga klimaks/overextended (Z={sig['z_score']:+.2f}, Ext={sig['ext_atr']:+.2f} ATR)"
-        lot_out, risk_out = lot_size, actual_risk_usd
+        lot_out, risk_out = 0.0, 0.0
     elif not sig["trigger_ok"]:
         decision = "NEUTRAL / HOLD"
         sniper_note = "Menunggu candle pemicu berkonviksi"
-        lot_out, risk_out = lot_size, actual_risk_usd
+        lot_out, risk_out = 0.0, 0.0
     else:
         decision = f"VERIFIED {bias}"
         sniper_note = "ALL_7_DISCIPLINE_SNIPER_GATES_PASSED"
@@ -2238,7 +2254,12 @@ def run_analysis_cycle(
     elif suppress_hold_notify and FORCE_NOTIFY:
         webhook_status = "Skipped Duplicate (Already Replied via /check)"
 
-    edge_tag = "NEGATIVE_EXPECTANCY_WARNING" if oos_neg_edge else "POSITIVE_EDGE"
+    if oos_neg_edge:
+        edge_tag = "NEGATIVE_EXPECTANCY_WARNING"
+    elif best_bt.get("oos_trades", 0) >= 3 and best_bt.get("oos_exp", 0.0) <= 0.0:
+        edge_tag = "OOS_SAMPLE_THIN_NEGATIVE"
+    else:
+        edge_tag = "POSITIVE_EDGE"
     forensic_audit_log(conn, {
         "timestamp_utc": now_utc.isoformat(),
         "decision": decision,
