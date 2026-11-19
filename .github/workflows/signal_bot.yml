@@ -115,7 +115,7 @@ jobs:
           LISTEN="${{ github.event.inputs.listen_seconds }}"
           if [ -z "$LISTEN" ]; then LISTEN="240"; fi
           echo "Launching engine :: mode=$MODE listen=$LISTEN"
-          python main.py --mode "$MODE" --listen-seconds "$LISTEN"
+          python bot.py --mode "$MODE" --listen-seconds "$LISTEN"
 
       # ----------------------------------------------------------------------
       # 5. Forensic DB inspection (always runs, never fails the job)
