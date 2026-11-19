@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-APEX-QUANT-OMNI SOVEREIGN (v78.0 — Multi-Disciplinary Institutional Edition)
-Spot Gold (XAUUSD) Quantitative Signal, Microstructure, Macro & Execution Engine
+APEX-QUANT-OMNI SOVEREIGN (v90.0 — ZERO-WHIPSAW EDITION)
+Spot Gold (XAUUSD) Institutional Multi-Disciplinary Quantitative Signal & Execution Engine
 
 7-Discipline Quantitative Synthesis (Strictly Causal, Zero Look-Ahead):
-1. Econophysics & Regime Science: Rolling Hurst Exponent (R/S), Kaufman Efficiency Ratio, Shannon Entropy
-2. Market Microstructure: Bulk Volume Classification (BVC) VPIN-Proxy, Garman-Klass Vol, Session VWAP Bands
-3. Cross-Asset Macro: Causal DXY (DX-Y.NYB) & US 10Y Real/Nominal Yield (^TNX) Driver Alignment
-4. Smart Money Structure (SMC): Fixed Prior-20 Liquidity Sweeps (1-bar & 2-bar), BOS Pullback-Retest, FVG
-5. Econometric Validation: 70/30 Purged Walk-Forward OOS with 16-Bar Embargo + Regularized Profit Factor
-6. Risk & Portfolio Math: Volatility-Targeted Fractional Kelly Sizing + Bayesian Shrinkage + Daily R Breaker
-7. Precision Systems Architecture: Sub-Second M15-Close Alignment, Cross-Feed Sanity Guard, SQLite WAL
+1. Smart Money Structure (SMC): Liquidity Sweeps (1-bar/2-bar), BOS, BOS-Retest, ChoCh & S/R Headroom
+2. Market Microstructure: Bulk Volume Classification (BVC) VPIN-Proxy, CLV Effort & Body-to-Wick Filter
+3. Econophysics & Regime Science: Rolling Hurst Exponent (R/S), Kaufman Efficiency Ratio, Shannon Entropy
+4. Statistical Fair Value: Anchored Daily UTC Session VWAP + EMA20 Z-Score Anti-Climax Guard
+5. Cross-Asset Macro Drivers: Causal 1H DXY (DX-Y.NYB) & US 10Y Yield (^TNX) Alignment
+6. Econometric Validation: 70/30 Purged Walk-Forward OOS with 16-Bar Embargo, SQN & Regularized PF
+7. Zero-Whipsaw & Precision Systems: Spike/Outlier Guard, SQLite Cooldown Lock, Vol-Kelly, WAL, Circuit Breaker
 """
 
 import os
@@ -46,7 +46,8 @@ logger = logging.getLogger("APEX-QUANT-OMNI")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-BOT_VERSION = "v78.0"
+BOT_VERSION = "v90.0"
+BOT_EDITION = "APEX-QUANT-OMNI SOVEREIGN v90.0 (ZERO-WHIPSAW EDITION)"
 EPSILON = 1e-8
 DB_PATH = os.getenv("SQLITE_DB_PATH", "trading_signals.db")
 CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
@@ -59,7 +60,7 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "10000.0"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))
 CONTRACT_OZ = float(os.getenv("XAU_CONTRACT_OZ", "100.0"))
-BASE_CONFLUENCE_THRESHOLD = int(os.getenv("CONFLUENCE_THRESHOLD", "68"))
+BASE_CONFLUENCE_THRESHOLD = int(os.getenv("CONFLUENCE_THRESHOLD", "70"))
 MAX_ALLOWED_SPREAD_USD = float(os.getenv("MAX_ALLOWED_SPREAD_USD", "3.00"))
 FORCE_NOTIFY = os.getenv("FORCE_NOTIFY", "false").lower() in ("1", "true", "yes")
 REQUIRE_POSITIVE_BACKTEST = os.getenv("REQUIRE_POSITIVE_BACKTEST", "false").lower() in ("1", "true", "yes")
@@ -76,6 +77,7 @@ MAX_DAILY_LOSS_R = float(os.getenv("MAX_DAILY_LOSS_R", "3.0"))
 MIN_BT_TRADES = int(os.getenv("MIN_BT_TRADES", "8"))
 PURGED_EMBARGO_BARS = int(os.getenv("PURGED_EMBARGO_BARS", "16"))
 MAX_POLLING_RUNTIME_SEC = int(os.getenv("MAX_POLLING_RUNTIME_SEC", "0"))
+SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "60"))
 
 MAX_EXTENSION_ATR = 1.50
 MAX_ENTRY_DRIFT_ATR = 0.65
@@ -83,6 +85,8 @@ MIN_ORDERFLOW_CONFIRM = 0.12
 MIN_PRIORITY_PILLAR_NORM = 60.0
 MIN_KAUFMAN_ER = float(os.getenv("MIN_KAUFMAN_ER", "0.18"))
 MAX_SHANNON_ENTROPY = float(os.getenv("MAX_SHANNON_ENTROPY", "0.94"))
+MIN_SR_HEADROOM_ATR = float(os.getenv("MIN_SR_HEADROOM_ATR", "0.35"))
+MAX_SPIKE_ATR_MULT = float(os.getenv("MAX_SPIKE_ATR_MULT", "4.5"))
 SIM_SLIPPAGE_USD = float(os.getenv("SIM_SLIPPAGE_USD", "0.15"))
 MIN_SL_USD = float(os.getenv("MIN_SL_USD", "3.00"))
 
@@ -281,6 +285,55 @@ def forensic_audit_log(conn: sqlite3.Connection, record: dict) -> None:
         record["smc_state"], record["mtf_state"], record["news_status"], record["source"],
     ))
     conn.commit()
+
+
+def check_signal_cooldown(
+    conn: sqlite3.Connection,
+    bar_time_utc: datetime,
+    bias: str,
+    smc_state: str,
+    smc_norm: float,
+    now_utc: datetime,
+) -> tuple[bool, str]:
+    """
+    SQLite Deduplication & Anti-Whipsaw Cooldown Lock:
+    - Blocks duplicate signals on the exact same M15 bar.
+    - Blocks sudden opposite-direction whipsaw flips within SIGNAL_COOLDOWN_MINUTES
+      unless validated by a confirmed ChoCh or Liquidity Sweep (>= 90 pts).
+    """
+    if bias not in ("BUY", "SELL"):
+        return True, "Standby"
+
+    last_bar = get_state(conn, "last_signal_bar_utc", "")
+    last_side = get_state(conn, "last_signal_side", "")
+    last_time_str = get_state(conn, "last_signal_time_utc", "")
+
+    cur_bar_iso = bar_time_utc.astimezone(timezone.utc).isoformat()
+    if last_bar == cur_bar_iso and last_side == bias:
+        return False, "Terkunci (Duplikat Bar)"
+
+    if last_side in ("BUY", "SELL") and last_side != bias and last_time_str:
+        try:
+            last_dt = datetime.fromisoformat(last_time_str)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            elapsed_min = (now_utc - last_dt).total_seconds() / 60.0
+            structural_flip = ("SWEEP" in smc_state or "CHOCH" in smc_state) and smc_norm >= 90.0
+            if elapsed_min < SIGNAL_COOLDOWN_MINUTES and not structural_flip:
+                rem = max(1, int(round(SIGNAL_COOLDOWN_MINUTES - elapsed_min)))
+                return False, f"Terkunci (Anti-Whipsaw {rem}m)"
+        except Exception:
+            pass
+
+    return True, "Lolos"
+
+
+def record_signal_cooldown(
+    conn: sqlite3.Connection, bar_time_utc: datetime, bias: str, now_utc: datetime
+) -> None:
+    set_state(conn, "last_signal_bar_utc", bar_time_utc.astimezone(timezone.utc).isoformat())
+    set_state(conn, "last_signal_side", bias)
+    set_state(conn, "last_signal_time_utc", now_utc.astimezone(timezone.utc).isoformat())
 
 
 # ==============================================================================
@@ -691,6 +744,23 @@ def _check_cross_feed_sanity(df15: pd.DataFrame, bbo: dict | None) -> bool:
         logger.warning(f"Cross-feed sanity reject: FeedClose={last_close:.2f} vs BBO={bbo['mid']:.2f} (diff=${diff:.2f})")
         return False
     return True
+
+
+def validate_market_data_sanity(
+    df15: pd.DataFrame, df1h: pd.DataFrame, bbo: dict | None
+) -> tuple[bool, str]:
+    """Hard structural sanity gate before analysis (anti-data-ngaco)."""
+    if df15 is None or df15.empty or len(df15) < 220:
+        return False, "INSUFFICIENT_15M_ROWS"
+    if df1h is None or df1h.empty or len(df1h) < 80:
+        return False, "INSUFFICIENT_1H_ROWS"
+    if not df15.index.is_monotonic_increasing or not df1h.index.is_monotonic_increasing:
+        return False, "NON_MONOTONIC_TIMESTAMPS"
+    if (df15[["Open", "High", "Low", "Close"]] <= 0).any().any() or df15[["Open", "High", "Low", "Close"]].isna().any().any():
+        return False, "INVALID_OR_NAN_OHLC"
+    if not _check_cross_feed_sanity(df15, bbo):
+        return False, "CROSS_FEED_DIVERGENCE"
+    return True, "Clean"
 
 
 def _fetch_twelvedata_spot(interval: str, outputsize: int) -> pd.DataFrame:
@@ -1124,6 +1194,17 @@ def _evaluate_smc_pillar(df: pd.DataFrame, idx: int) -> tuple[float, str, str, f
         pts = 88.0 if (bear_fvg and ext <= 1.3) else (78.0 if ext <= 1.5 else 52.0)
         return pts, "BEARISH_BOS_DOWN", "SELL", recent_swing_low, recent_swing_high
 
+    # Programmatic ChoCh (Change of Character) after prior counter-swing structure
+    if len(w) >= 24:
+        prior_bear = float(w["High"].iloc[-14:-6].max()) < float(w["High"].iloc[-22:-14].max())
+        prior_bull = float(w["Low"].iloc[-14:-6].min()) > float(w["Low"].iloc[-22:-14].min())
+        choch_high_lvl = float(w["High"].iloc[-10:-1].max())
+        choch_low_lvl = float(w["Low"].iloc[-10:-1].min())
+        if prior_bear and c > choch_high_lvl and c > o:
+            return (92.0 if bull_fvg else 86.0), "BULLISH_CHOCH_REVERSAL", "BUY", recent_swing_low, recent_swing_high
+        if prior_bull and c < choch_low_lvl and c < o:
+            return (92.0 if bear_fvg else 86.0), "BEARISH_CHOCH_REVERSAL", "SELL", recent_swing_low, recent_swing_high
+
     hh = float(w["High"].iloc[-6:].max()) > float(w["High"].iloc[-14:-6].max())
     hl = float(w["Low"].iloc[-6:].min()) > float(w["Low"].iloc[-14:-6].min())
     lh = float(w["High"].iloc[-6:].max()) < float(w["High"].iloc[-14:-6].max())
@@ -1324,6 +1405,33 @@ def score_bar_confluence(
     # 6. Cross-Asset Macro Drivers: Causal DXY + US10Y Yield (10%)
     macro_norm, macro_label = _evaluate_causal_macro_pillar(macro_data, ts, bias)
 
+    # 7. Zero-Whipsaw Spike Guard & Support/Resistance Headroom Guard
+    atr_ma20 = max(float(row.get("ATR_MA20", atr)), EPSILON)
+    bar_range = float(row["High"] - row["Low"])
+    prev_close = float(df15["Close"].iloc[idx15 - 1]) if idx15 > 0 else close
+    range_atr = bar_range / atr_ma20
+    jump_atr = abs(close - prev_close) / atr_ma20
+    spike_ok = not (range_atr > MAX_SPIKE_ATR_MULT or (jump_atr > 4.0 and body_ratio < 0.45))
+    spike_status = "Clean" if spike_ok else f"Spike Filtered ({range_atr:.1f}x ATR)"
+
+    look_start = max(0, idx15 - 20)
+    if idx15 - look_start >= 10:
+        res_20 = float(df15["High"].iloc[look_start:idx15].max())
+        sup_20 = float(df15["Low"].iloc[look_start:idx15].min())
+    else:
+        res_20, sup_20 = swing_high, swing_low
+
+    is_breakout = "BOS_UP" in smc_state or "BOS_DOWN" in smc_state or "CHOCH" in smc_state
+    if bias == "BUY" and not is_breakout and (0.0 <= (res_20 - close) / atr < MIN_SR_HEADROOM_ATR):
+        sr_headroom_ok = False
+        sr_note = f"Near 20-bar Resistance ({res_20:.2f})"
+    elif bias == "SELL" and not is_breakout and (0.0 <= (close - sup_20) / atr < MIN_SR_HEADROOM_ATR):
+        sr_headroom_ok = False
+        sr_note = f"Near 20-bar Support ({sup_20:.2f})"
+    else:
+        sr_headroom_ok = True
+        sr_note = "Clear"
+
     weighted_score = (
         smc_norm * PILLAR_WEIGHTS["smc"]
         + of_norm * PILLAR_WEIGHTS["order_flow"]
@@ -1370,6 +1478,10 @@ def score_bar_confluence(
         "trigger_ok": trigger_ok,
         "anti_chase_ok": anti_chase_ok,
         "regime_quality_ok": regime_quality_ok,
+        "spike_ok": spike_ok,
+        "spike_status": spike_status,
+        "sr_headroom_ok": sr_headroom_ok,
+        "sr_note": sr_note,
         "of_ok": of_ok,
         "smc_norm": smc_norm,
         "of_norm": of_norm,
@@ -1622,6 +1734,8 @@ def run_synchronized_backtest(
             and sig["htf_aligned"]
             and sig["priority_pillars_ok"]
             and sig["regime_quality_ok"]
+            and sig["spike_ok"]
+            and sig["sr_headroom_ok"]
             and sig["adx"] >= 20.0
             and sig["anti_chase_ok"]
             and sig["of_ok"]
@@ -2003,7 +2117,7 @@ def send_discord_alert(message: str) -> None:
 
 
 # ==============================================================================
-# CLEAN TELEGRAM CARD FORMATTER
+# INSTITUTIONAL TELEGRAM / DISCORD WEBHOOK FORMATTER (v90.0 TEMPLATE)
 # ==============================================================================
 def build_telegram_signal_card(
     decision: str,
@@ -2026,60 +2140,91 @@ def build_telegram_signal_card(
     news_gov: dict,
     best_bt: dict,
     active_trade: dict | None,
+    data_src: str = "Spot Feed Nominal",
+    cooldown_status: str = "Lolos",
+    webhook_label: str = "Terkirim via Exponential Backoff",
+    exec_utc: datetime | None = None,
 ) -> str:
-    if news_gov["upcoming"]:
-        nxt = news_gov["upcoming"][0]
-        news_short = f"CLEAR ({_esc(nxt['title'])} {_format_minutes_human(nxt['delta_min'])})"
-    else:
-        news_short = "CLEAR"
+    ts_iso = (exec_utc or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    is_verified = decision.startswith("VERIFIED")
 
-    oos_exp = best_bt.get("oos_exp", 0.0)
-    oos_n = best_bt.get("oos_trades", 0)
-    bt_warn = " ⚠️Neg.OOS" if (oos_n >= 5 and oos_exp <= 0) else ""
-    bt_line = (
-        f"N={best_bt['trades']} WR <code>{best_bt['wr']}%</code> PF <code>{best_bt['pf']}</code> "
-        f"Exp <code>{best_bt['exp']:+.2f}R</code> (OOS {oos_exp:+.2f}R){bt_warn}"
+    mtf_pillar_status = (
+        f"Selaras ({_esc(sig['smc_state'])} | {_esc(sig['macro_label'])})"
+        if (sig["htf_aligned"] and sig["priority_pillars_ok"] and sig["sr_headroom_ok"])
+        else f"Terblokir ({_esc(sniper_note)})"
     )
-    regime_line = f"H=<code>{sig['hurst']:.2f}</code> ER=<code>{sig['kaufman_er']:.2f}</code> Ent=<code>{sig['entropy']:.2f}</code>"
+    sanity_guard_status = f"{_esc(sig.get('spike_status', 'Clean'))} (Spr ${spread_usd:.2f})"
+    sesi_status = (
+        f"Terverifikasi Aman ({_esc(session_name)})"
+        if "ACTIVE" in session_name
+        else f"Terfilter ({_esc(session_name)})"
+    )
+    trail_proto = (
+        "Aktif @ TP1 Breakeven (+0.5R Trail @ 1.8R)"
+        if is_verified
+        else f"Standby ({_esc(news_gov['status_code'])})"
+    )
 
-    if news_gov["hard_blackout"]:
-        ev = news_gov["active_event"]
-        resume_str = format_utc_wib(news_gov["resume_utc"]) if news_gov["resume_utc"] else "-"
-        return (
-            f"⛔ <b>XAUUSD HARD BLACKOUT</b>\n"
-            f"<b>Berita:</b> {_esc(ev['title'])}\n"
-            f"<b>Spot:</b> <code>{bid:.2f} / {ask:.2f}</code> (Spr <code>${spread_usd:.2f}</code>)\n"
-            f"<b>Status:</b> Sinyal BUY/SELL ditangguhkan (anti-slippage)\n"
-            f"<b>Lanjut Est:</b> <code>{_esc(resume_str)}</code>"
-        )
+    if is_verified:
+        entry_str = f"{entry:.2f}"
+        sl_str = f"{sl:.2f}"
+        tp1_str = f"{tp1:.2f}"
+        tp2_str = f"{tp2:.2f}"
+        tp3_str = f"{tp3:.2f}"
+    else:
+        entry_str = f"{bid:.2f} / {ask:.2f} (Standby)"
+        sl_str = f"{sl:.2f}" if sl > 0 else "N/A (HOLD)"
+        tp1_str = f"{tp1:.2f}" if tp1 > 0 else "N/A (HOLD)"
+        tp2_str = f"{tp2:.2f}" if tp2 > 0 else "N/A (HOLD)"
+        tp3_str = f"{tp3:.2f}" if tp3 > 0 else "N/A (HOLD)"
 
-    if decision.startswith("VERIFIED"):
-        icon = "🟢" if bias == "BUY" else "🔴"
-        return (
-            f"{icon} <b>{_esc(decision)} — XAUUSD</b> | Score <code>{sig['score']}/100</code>\n"
-            f"<b>Entry:</b> <code>{entry:.2f}</code> | <b>SL:</b> <code>{sl:.2f}</code>\n"
-            f"<b>TP1:</b> <code>{tp1:.2f}</code> | <b>TP2:</b> <code>{tp2:.2f}</code> | <b>TP3:</b> <code>{tp3:.2f}</code>\n"
-            f"<b>Risk:</b> Lot <code>{lot_out:.2f}</code> (<code>${risk_out:.2f}</code> / <code>{eff_risk_pct:.2f}%</code>) | Spr <code>${spread_usd:.2f}</code>\n"
-            f"<b>Regime:</b> {regime_line} | <b>{_esc(sig['macro_label'])}</b>\n"
-            f"<b>News:</b> {_esc(news_short)}\n"
-            f"<b>BT:</b> {bt_line}"
-        )
-
-    pos_line = ""
+    pos_extra = ""
     if active_trade:
-        pos_line = (
-            f"\n<b>Posisi Aktif #{active_trade['id']}:</b> <code>{_esc(active_trade['side'])} @ {active_trade['entry']:.2f}</code> "
+        pos_extra = (
+            f"\n• <i>Posisi Aktif #{active_trade['id']}:</i> "
+            f"<code>{_esc(active_trade['side'])} @ {active_trade['entry']:.2f}</code> "
             f"(SL <code>{active_trade['sl']:.2f}</code> | <code>{_esc(active_trade['status'])}</code>)"
         )
 
     return (
-        f"🟡 <b>XAUUSD HOLD</b> | Score <code>{sig['score']}/100</code> (Req&gt;={req_score})\n"
-        f"<b>Spot:</b> <code>{bid:.2f} / {ask:.2f}</code> (Spr <code>${spread_usd:.2f}</code>)\n"
-        f"<b>Bias ({_esc(bias)}):</b> {_esc(sniper_note)}\n"
-        f"<b>Regime:</b> {regime_line} | <b>Sesi:</b> <code>{_esc(session_name)}</code>\n"
-        f"<b>News:</b> {_esc(news_short)}\n"
-        f"<b>BT (~1Bln):</b> {bt_line}"
-        f"{pos_line}"
+        f"🛡️ <b>{_esc(BOT_EDITION)}</b> 🛡️\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌟 <b>Aset:</b> XAUUSD (SPOT GOLD)\n"
+        f"📊 <b>Keputusan Sinyal:</b> <code>{_esc(decision)}</code>\n"
+        f"🎯 <b>Harga Entry Presisi:</b> <code>{_esc(entry_str)}</code>\n"
+        f"🛑 <b>Stop Loss Forensik:</b> <code>{_esc(sl_str)}</code>\n"
+        f"📈 <b>Take Profit 1 (1.5R):</b> <code>{_esc(tp1_str)}</code>\n"
+        f"📈 <b>Take Profit 2 (2.5R):</b> <code>{_esc(tp2_str)}</code>\n"
+        f"🚀 <b>Take Profit 3 (4.0R):</b> <code>{_esc(tp3_str)}</code>\n"
+        f"🔄 <b>Protokol Trailing Stop:</b> {_esc(trail_proto)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡️ <b>Anti-Whipsaw &amp; Data Sanity Guard:</b>\n"
+        f"• <i>Validasi Multi-TF &amp; Pilar:</i> {mtf_pillar_status}\n"
+        f"• <i>Status Data &amp; Spike Guard:</i> {sanity_guard_status}\n"
+        f"• <i>Status Cooldown SQLite:</i> {_esc(cooldown_status)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 <b>Multi-Source, Sesi &amp; Bot 2-Arah:</b>\n"
+        f"• <i>Feed Aktif:</i> {_esc(data_src)}\n"
+        f"• <i>Sesi Pasar:</i> {sesi_status}\n"
+        f"• <i>Perintah Interaktif:</i> Siap via Telegram (/check /signal)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚙️ <b>Grid Search &amp; Exponential Backoff:</b>\n"
+        f"• <i>Periode ATR Optimal:</i> <code>{best_bt['atr']}</code>\n"
+        f"• <i>Ambang Z-Score Optimal:</i> <code>{best_bt['z']:.1f}</code>\n"
+        f"• <i>Status Webhook:</i> {_esc(webhook_label)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Risiko &amp; Position Sizing:</b>\n"
+        f"• <i>Rekomendasi Lot:</i> <code>{lot_out:.2f} Lots</code> (Risiko {eff_risk_pct:.2f}%)\n"
+        f"• <i>Nilai Risiko (USD):</i> <code>${risk_out:.2f}</code>{pos_extra}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔬 <b>Audit Forensik, Artifact DB &amp; Backtest:</b>\n"
+        f"• <i>Skor Konfluensi:</i> <code>{sig['score']}/100</code> (Req&gt;={req_score})\n"
+        f"• <i>Artifact SQLite:</i> Tersimpan &amp; Terunggah\n"
+        f"• <i>Win Rate Teroptimasi:</i> <code>{best_bt['wr']:.1f}%</code> (OOS {best_bt.get('oos_wr', 0.0):.1f}%)\n"
+        f"• <i>Profit Factor:</i> <code>{best_bt['pf']:.2f}</code> (SQN {best_bt.get('sqn', 0.0):.2f})\n"
+        f"• <i>Max Drawdown:</i> <code>{best_bt['mdd']:.1f}%</code>\n"
+        f"• <i>Waktu Eksekusi (UTC):</i> <code>{_esc(ts_iso)}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
     )
 
 
@@ -2099,6 +2244,10 @@ def run_analysis_cycle(
     news_gov = evaluate_news_governor(events, now_utc, news_src)
 
     df15_raw, df1h_raw, bbo, data_src = ingest_spot_gold_data(now_utc)
+    sanity_ok, sanity_reason = validate_market_data_sanity(df15_raw, df1h_raw, bbo)
+    if not sanity_ok:
+        raise RuntimeError(f"MARKET_DATA_SANITY_CIRCUIT_BREAKER: {sanity_reason}")
+
     macro_data = ingest_macro_drivers()
     bid = bbo["bid"] if bbo else float(df15_raw["Close"].iloc[-1])
     ask = bbo["ask"] if bbo else bid
@@ -2147,77 +2296,93 @@ def run_analysis_cycle(
     min_lot_overrisk = (raw_lot < 0.01) and (actual_risk_usd > target_risk_usd * 1.25)
 
     session_ok, session_reason, session_name, req_score = evaluate_session_governor(now_utc, spread_usd)
+    cooldown_ok, cooldown_status = check_signal_cooldown(
+        conn, sig["bar_time_utc"], bias, sig["smc_state"], sig["smc_norm"], now_utc
+    )
 
     if news_gov["hard_blackout"]:
-        decision = "HARD BLACKOUT / NEWS HOLD"
+        decision = "NO_SIGNAL / HARD BLACKOUT"
         sniper_note = f"Signal suspended ({news_gov['status_code']}) to avoid slippage"
         lot_out, risk_out = 0.0, 0.0
     elif not session_ok:
-        decision = "SESSION HOLD"
+        decision = "NO_SIGNAL / SESSION HOLD"
         sniper_note = session_reason
         lot_out, risk_out = 0.0, 0.0
     elif is_stale:
-        decision = "STALE DATA / HOLD"
+        decision = "NO_SIGNAL / STALE DATA"
         sniper_note = f"Feed candle terlambat ({closed_age_min:.0f}m > {MAX_DATA_STALE_MINUTES}m)"
         lot_out, risk_out = 0.0, 0.0
+    elif not sig["spike_ok"]:
+        decision = "NO_SIGNAL / SPIKE FILTERED"
+        sniper_note = f"Anomali outlier terdeteksi ({sig['spike_status']})"
+        lot_out, risk_out = 0.0, 0.0
     elif cb_tripped:
-        decision = "RISK CIRCUIT BREAKER / HOLD"
+        decision = "NO_SIGNAL / CIRCUIT BREAKER"
         sniper_note = f"Daily realized loss {daily_r:+.2f}R <= -{MAX_DAILY_LOSS_R:.1f}R limit"
         lot_out, risk_out = 0.0, 0.0
     elif active_trade is not None:
-        decision = "POSITION ACTIVE / HOLD"
+        decision = "NO_SIGNAL / POSITION ACTIVE"
         sniper_note = f"Trade #{active_trade['id']} ({active_trade['side']}) masih {active_trade['status']} (single-position lock)"
         lot_out, risk_out = 0.0, 0.0
+    elif not cooldown_ok:
+        decision = "NO_SIGNAL / COOLDOWN LOCK"
+        sniper_note = f"Anti-Whipsaw Cooldown aktif ({cooldown_status})"
+        lot_out, risk_out = 0.0, 0.0
     elif REQUIRE_POSITIVE_BACKTEST and oos_neg_edge:
-        decision = "NEUTRAL / HOLD"
+        decision = "NO_SIGNAL / HOLD"
         sniper_note = f"OOS/BT edge negatif (BT Exp {best_bt['exp']:+.2f}R, OOS {best_bt.get('oos_exp', 0.0):+.2f}R)"
         lot_out, risk_out = 0.0, 0.0
     elif bias == "NEUTRAL":
-        decision = "NEUTRAL / HOLD"
+        decision = "NO_SIGNAL / HOLD"
         sniper_note = f"Tidak ada bias terarah ({sig['mtf_state']})"
         lot_out, risk_out = 0.0, 0.0
     elif not sig["htf_aligned"]:
-        decision = "NEUTRAL / HOLD"
+        decision = "NO_SIGNAL / HOLD"
         sniper_note = f"Kontra tren 1H ({sig['mtf_state']})"
         lot_out, risk_out = 0.0, 0.0
+    elif not sig["sr_headroom_ok"]:
+        decision = "NO_SIGNAL / HOLD"
+        sniper_note = f"Anti-Whipsaw S/R Guard ({sig['sr_note']})"
+        lot_out, risk_out = 0.0, 0.0
     elif not sig["regime_quality_ok"]:
-        decision = "NEUTRAL / HOLD"
+        decision = "NO_SIGNAL / HOLD"
         sniper_note = f"Rezim noise/choppy (ER={sig['kaufman_er']:.2f}, Ent={sig['entropy']:.2f}, H={sig['hurst']:.2f})"
         lot_out, risk_out = 0.0, 0.0
     elif drift_atr > MAX_ENTRY_DRIFT_ATR:
-        decision = "NEUTRAL / HOLD"
+        decision = "NO_SIGNAL / HOLD"
         sniper_note = f"Entry drift terlalu jauh ({drift_atr:.2f} ATR dari close M15)"
         lot_out, risk_out = 0.0, 0.0
     elif sig["smc_norm"] < MIN_PRIORITY_PILLAR_NORM:
-        decision = "NEUTRAL / HOLD"
+        decision = "NO_SIGNAL / HOLD"
         sniper_note = f"SMC Structure lemah ({sig['smc_norm']:.0f}/{MIN_PRIORITY_PILLAR_NORM:.0f})"
         lot_out, risk_out = 0.0, 0.0
     elif sig["of_norm"] < MIN_PRIORITY_PILLAR_NORM or not sig["of_ok"]:
-        decision = "NEUTRAL / HOLD"
+        decision = "NO_SIGNAL / HOLD"
         sniper_note = f"OrderFlow belum terkonfirmasi ({sig['order_flow']:+.2f})"
         lot_out, risk_out = 0.0, 0.0
     elif sig["score"] < req_score:
-        decision = "NEUTRAL / HOLD"
+        decision = "NO_SIGNAL / HOLD"
         sniper_note = f"Skor {sig['score']} belum mencapai Req {req_score}"
         lot_out, risk_out = 0.0, 0.0
     elif sig["adx"] < 20.0:
-        decision = "NEUTRAL / HOLD"
+        decision = "NO_SIGNAL / HOLD"
         sniper_note = f"ADX lemah ({sig['adx']:.1f} below 20.0)"
         lot_out, risk_out = 0.0, 0.0
     elif not sig["anti_chase_ok"]:
-        decision = "NEUTRAL / HOLD"
+        decision = "NO_SIGNAL / HOLD"
         sniper_note = f"Harga klimaks/overextended (Z={sig['z_score']:+.2f}, Ext={sig['ext_atr']:+.2f} ATR)"
         lot_out, risk_out = 0.0, 0.0
     elif not sig["trigger_ok"]:
-        decision = "NEUTRAL / HOLD"
+        decision = "NO_SIGNAL / HOLD"
         sniper_note = "Menunggu candle pemicu berkonviksi"
         lot_out, risk_out = 0.0, 0.0
     else:
         decision = f"VERIFIED {bias}"
-        sniper_note = "ALL_7_DISCIPLINE_SNIPER_GATES_PASSED"
+        sniper_note = "ALL_ZERO_WHIPSAW_GATES_PASSED"
         if min_lot_overrisk:
             sniper_note += f" (WARN: min lot 0.01 risks ${actual_risk_usd:.2f} > target ${target_risk_usd:.2f})"
         lot_out, risk_out = lot_size, actual_risk_usd
+        record_signal_cooldown(conn, sig["bar_time_utc"], bias, now_utc)
         tid = register_active_trade(
             conn, now_utc, sig["bar_time_utc"], bias, entry, sl, tp1, tp2, tp3, lot_out, sig["score"], cost_r
         )
@@ -2226,15 +2391,6 @@ def run_analysis_cycle(
             "tp1": tp1, "tp2": tp2, "tp3": tp3, "status": "OPEN",
         }
 
-    msg_html = build_telegram_signal_card(
-        decision=decision, bias=bias, sig=sig, req_score=req_score,
-        bid=bid, ask=ask, spread_usd=spread_usd,
-        entry=entry, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
-        lot_out=lot_out, risk_out=risk_out, eff_risk_pct=eff_risk_pct,
-        sniper_note=sniper_note, session_name=session_name,
-        news_gov=news_gov, best_bt=best_bt, active_trade=active_trade,
-    )
-
     is_verified_op = decision.startswith("VERIFIED")
     should_send = (
         notify_mode == "command"
@@ -2242,15 +2398,31 @@ def run_analysis_cycle(
         or news_gov["hard_blackout"]
         or (FORCE_NOTIFY and not suppress_hold_notify)
     )
+    planned_wh_label = (
+        "On-Demand Reply (Exponential Backoff)"
+        if notify_mode == "command"
+        else ("Terkirim via Exponential Backoff" if should_send else "Standby (Hold Threshold)")
+    )
+
+    msg_html = build_telegram_signal_card(
+        decision=decision, bias=bias, sig=sig, req_score=req_score,
+        bid=bid, ask=ask, spread_usd=spread_usd,
+        entry=entry, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+        lot_out=lot_out, risk_out=risk_out, eff_risk_pct=eff_risk_pct,
+        sniper_note=sniper_note, session_name=session_name,
+        news_gov=news_gov, best_bt=best_bt, active_trade=active_trade,
+        data_src=data_src, cooldown_status=cooldown_status,
+        webhook_label=planned_wh_label, exec_utc=now_utc,
+    )
 
     webhook_status = "Standby (Hold Threshold)"
     if should_send:
         ok_tg = send_telegram_message(msg_html, chat_id=reply_chat_id)
         if notify_mode == "command":
-            webhook_status = "On-Demand /check Reply (Exponential Backoff)" if ok_tg else "Reply Failed"
+            webhook_status = "On-Demand Reply (Exponential Backoff)" if ok_tg else "Reply Failed"
         else:
             send_discord_alert(msg_html)
-            webhook_status = "Delivered via Exponential Backoff" if ok_tg else "Telegram Delivery Failed"
+            webhook_status = "Terkirim via Exponential Backoff" if ok_tg else "Telegram Delivery Failed"
     elif suppress_hold_notify and FORCE_NOTIFY:
         webhook_status = "Skipped Duplicate (Already Replied via /check)"
 
@@ -2260,6 +2432,7 @@ def run_analysis_cycle(
         edge_tag = "OOS_SAMPLE_THIN_NEGATIVE"
     else:
         edge_tag = "POSITIVE_EDGE"
+
     forensic_audit_log(conn, {
         "timestamp_utc": now_utc.isoformat(),
         "decision": decision,
@@ -2287,6 +2460,7 @@ def run_analysis_cycle(
     logger.info("========== FORENSIC AUDIT LOG ==========")
     logger.info(f"Asset=XAUUSD (SPOT GOLD) | Decision={decision} | Score={sig['score']}/100 (Req>={req_score}) | ClosedBar={sig['bar_time_utc'].strftime('%Y-%m-%d %H:%M UTC')} (age={closed_age_min:.1f}m)")
     logger.info(f"WeightedPillars: {sig['weighted_breakdown']} | VolMode={sig['vol_mode']} | Drift={drift_atr:.2f} ATR | Source={data_src}")
+    logger.info(f"Guards: Sanity={sanity_reason} | Spike={sig['spike_status']} | SR_Headroom={sig['sr_note']} | Cooldown={cooldown_status}")
     logger.info(f"Entry={entry:.2f} | SL={sl:.2f} | TP1={tp1:.2f} | TP2={tp2:.2f} | TP3={tp3:.2f} | Bid={bid:.2f} Ask={ask:.2f} Spread=${spread_usd:.2f}")
     logger.info(f"Z={sig['z_score']:.3f} VWAP_Dist={sig['vwap_dist_atr']:+.2f}ATR | ADX={sig['adx']:.1f} GK_Ratio={sig['gk_ratio']:.2f} | H={sig['hurst']:.2f} ER={sig['kaufman_er']:.2f} Ent={sig['entropy']:.2f}")
     logger.info(f"SMC={sig['smc_state']} | OF={sig['of_label']} | MTF={sig['mtf_state']} | {sig['macro_label']}")
@@ -2409,7 +2583,7 @@ def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -
         seen_batch.add(batch_key)
 
         logger.info(f"Processing 2-Way Telegram command [{cmd}] from chat_id=***")
-        if cmd == "/check":
+        if cmd in ("/check", "/signal"):
             run_analysis_cycle(conn, notify_mode="command", reply_chat_id=chat_id, force_news_refresh=True)
             handled_check = True
         elif cmd == "/news":
@@ -2418,7 +2592,7 @@ def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -
             send_telegram_message(_build_audit_reply(conn), chat_id=chat_id)
         elif cmd == "/chart":
             if os.path.exists(CHART_PATH):
-                send_telegram_photo(CHART_PATH, f"APEX-QUANT-OMNI {BOT_VERSION} Backtest Equity", chat_id=chat_id)
+                send_telegram_photo(CHART_PATH, f"{BOT_EDITION} Backtest Equity", chat_id=chat_id)
             else:
                 send_telegram_message("Chart belum tersedia; jalankan /check terlebih dahulu.", chat_id=chat_id)
         elif cmd == "/status":
@@ -2442,8 +2616,8 @@ def process_telegram_commands(conn: sqlite3.Connection, poll_timeout: int = 0) -
             send_telegram_message(status_msg, chat_id=chat_id)
         elif cmd in ("/help", "/start"):
             help_msg = (
-                f"🤖 <b>APEX-QUANT-OMNI {BOT_VERSION}</b>\n"
-                "/check — Analisa cepat XAUUSD + news\n"
+                f"🤖 <b>{_esc(BOT_EDITION)}</b>\n"
+                "/check atau /signal — Analisa cepat XAUUSD + news\n"
                 "/news — Jadwal High-Impact USD\n"
                 "/status — Sesi &amp; spread live\n"
                 "/chart — Grafik backtest\n"
@@ -2464,7 +2638,7 @@ def run_continuous_polling_loop(conn: sqlite3.Connection) -> None:
     Precision M15 Candle-Close Aligned Polling Loop:
     Executes within ~2 seconds of :00, :15, :30, :45 UTC bar close instead of drifting every 900s.
     """
-    logger.info(f"Starting APEX-QUANT-OMNI {BOT_VERSION} Precision Candle-Aligned Polling Mode...")
+    logger.info(f"Starting {BOT_EDITION} Precision Candle-Aligned Polling Mode...")
     started_at = time.time()
     last_bar_bucket = ""
 
@@ -2488,12 +2662,12 @@ def run_continuous_polling_loop(conn: sqlite3.Connection) -> None:
             break
         except Exception as exc:
             logger.error(f"Polling loop error: {exc}")
-            send_telegram_message(f"⚠️ <b>BOT ERROR ({BOT_VERSION}):</b> <code>{_esc(exc)}</code>")
+            send_telegram_message(f"🚨 <b>CIRCUIT BREAKER / POLLING ERROR ({BOT_VERSION}):</b> <code>{_esc(exc)}</code>")
             time.sleep(10)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=f"APEX-QUANT-OMNI {BOT_VERSION}")
+    parser = argparse.ArgumentParser(description=BOT_EDITION)
     parser.add_argument("--mode", choices=["oneshot", "polling"], default="oneshot")
     args = parser.parse_args()
 
@@ -2506,10 +2680,14 @@ def main() -> None:
             if not handled_check:
                 run_analysis_cycle(conn, notify_mode="auto")
             else:
-                logger.info("Skipped redundant auto cycle because /check already executed in oneshot batch.")
+                logger.info("Skipped redundant auto cycle because /check or /signal already executed in oneshot batch.")
     except Exception as exc:
-        logger.exception(f"Fatal execution error: {exc}")
-        send_telegram_message(f"🚨 <b>FATAL ERROR ({BOT_VERSION}):</b> <code>{_esc(exc)}</code>")
+        logger.exception(f"Circuit Breaker triggered — Fatal execution error: {exc}")
+        send_telegram_message(
+            f"🚨 <b>CIRCUIT BREAKER DARURAT ({_esc(BOT_EDITION)})</b>\n"
+            f"<b>Status:</b> Eksekusi dihentikan aman\n"
+            f"<b>Penyebab:</b> <code>{_esc(exc)}</code>"
+        )
         raise
     finally:
         close_db(conn)
