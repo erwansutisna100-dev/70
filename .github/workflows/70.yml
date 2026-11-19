@@ -62,7 +62,9 @@ jobs:
       - name: Run Forensic Invariant Suite
         run: |
           if [ -f tests/test_forensic_invariants.py ]; then
-            pytest -q tests/test_forensic_invariants.py
+            PYTHONPATH=. python -m pytest -q tests/test_forensic_invariants.py
+          elif [ -f test_forensic_invariants.py ]; then
+            PYTHONPATH=. python -m pytest -q test_forensic_invariants.py
           fi
 
       - name: Restore SQLite state from latest completed artifact
@@ -91,16 +93,19 @@ jobs:
           ACCOUNT_BALANCE: "10000.0"
           RISK_PERCENT: "1.0"
           XAU_CONTRACT_OZ: "100.0"
-          CONFLUENCE_THRESHOLD: "68"
+          CONFLUENCE_THRESHOLD: "70"
           MAX_ALLOWED_SPREAD_USD: "3.00"
           MAX_DATA_STALE_MINUTES: "45"
           MAX_DAILY_LOSS_R: "3.0"
           MIN_BT_TRADES: "8"
           PURGED_EMBARGO_BARS: "16"
+          SIGNAL_COOLDOWN_MINUTES: "60"
           ENABLE_MACRO_DRIVERS: "true"
           ENABLE_VOL_KELLY_SIZING: "true"
           MIN_KAUFMAN_ER: "0.18"
           MAX_SHANNON_ENTROPY: "0.94"
+          MIN_SR_HEADROOM_ATR: "0.35"
+          MAX_SPIKE_ATR_MULT: "4.5"
           NEWS_BLACKOUT_BEFORE_MIN: "45"
           NEWS_BLACKOUT_AFTER_MIN: "30"
           NEWS_CACHE_TTL_MINUTES: "15"
