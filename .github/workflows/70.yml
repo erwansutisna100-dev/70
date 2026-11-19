@@ -2,17 +2,18 @@ name: APEX-QUANT-OMNI Sovereign XAUUSD Bot
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    # Jalan tiap 45 menit HANYA pada Senin-Jumat jam 14.00 - 23.00 WIB (07:00 - 16:00 UTC)
+    - cron: "*/45 7-15 * * 1-5"
   workflow_dispatch:
     inputs:
       bot_mode:
-        description: "Execution mode (oneshot or polling)"
+        description: "Execution mode (polling or oneshot)"
         required: true
-        default: "oneshot"
+        default: "polling"
         type: choice
         options:
-          - oneshot
           - polling
+          - oneshot
       force_notify:
         description: "Force Telegram/Discord report even on HOLD/Blackout"
         required: true
@@ -42,7 +43,7 @@ permissions:
 jobs:
   run-signal-engine:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 48
 
     steps:
       - name: Checkout repository
@@ -110,10 +111,10 @@ jobs:
           NEWS_BLACKOUT_AFTER_MIN: "30"
           NEWS_CACHE_TTL_MINUTES: "15"
           NEWS_DEGRADED_TTL_MINUTES: "2"
-          BOT_MODE: ${{ github.event.inputs.bot_mode || 'oneshot' }}
+          BOT_MODE: ${{ github.event.inputs.bot_mode || 'polling' }}
           FORCE_NOTIFY: ${{ github.event.inputs.force_notify || 'false' }}
           REQUIRE_POSITIVE_BACKTEST: ${{ github.event.inputs.require_positive_backtest || 'true' }}
-          MAX_POLLING_RUNTIME_SEC: "480"
+          MAX_POLLING_RUNTIME_SEC: "2520"
           MPLBACKEND: "Agg"
         run: |
           python bot.py --mode "${BOT_MODE}"
